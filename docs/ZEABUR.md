@@ -80,7 +80,35 @@ DATA_DIR=/data
 
 ---
 
-## 六、建置與啟動
+## 六、重新部署（程式已推上 GitHub）
+
+每次改完程式要讓 Zeabur 跑新版本，照下面做：
+
+1. **本機提交並推送到 GitHub**
+   ```bash
+   git add .
+   git commit -m "你的說明"
+   git push origin main
+   ```
+   （若主分支叫 `master` 就改成 `git push origin master`）
+
+2. **Zeabur 自動部署**
+   - 專案若已用「Deploy from GitHub」建立，Zeabur 會偵測到 push，**自動開始建置與部署**。
+   - 登入 [Zeabur](https://zeabur.com) → 選你的專案 → 選該服務，在 **Deployments** 或首頁可看到最新部署狀態。
+
+3. **若沒有自動部署**
+   - 進該服務 → 點 **Redeploy**（或 **Deploy**）手動觸發一次。
+   - 或到 **Settings** 確認已連結正確的 GitHub repo 與分支。
+
+4. **部署完成後**
+   - 到 **Logs** 確認 `npm start` 有正常跑、沒有紅字錯誤。
+   - 用瀏覽器開你的 Zeabur 網址測一下（例如 LINE 登入）。
+
+**注意**：改 **Variables**（環境變數）後也要在該服務點一次 **Redeploy**，新變數才會套用到運行中的容器。
+
+---
+
+## 七、建置與啟動
 
 - Zeabur 會依 `package.json` 的 **start** 執行：`npm start` → `node src/index.js`。
 - 會自動注入 **PORT**，程式已使用 `process.env.PORT || 3001`，無需改程式。
@@ -88,7 +116,7 @@ DATA_DIR=/data
 
 ---
 
-## 七、自訂網域（選用）
+## 八、自訂網域（選用）
 
 - 在 Zeabur 該服務的 **Networking / Domain** 綁定自己的網域（例如 `order.example.com`）。
 - 綁好並有 HTTPS 後，把上述所有 `https://你的服務名.zeabur.app` 改成 `https://order.example.com`，並同步更新：
@@ -97,7 +125,7 @@ DATA_DIR=/data
 
 ---
 
-## 八、檢查表
+## 九、檢查表
 
 - [ ] 專案已從 GitHub 部署，且 `npm start` 可正常啟動。
 - [ ] 環境變數已設（含 `LINE_*`、`DATA_DIR=/data`），且無 localhost。
@@ -109,7 +137,7 @@ DATA_DIR=/data
 
 ---
 
-## 九、常見問題
+## 十、常見問題
 
 **Q：重新部署後訂單都不見了？**  
 A：多半是沒掛 Volume 或沒設 `DATA_DIR=/data`。請依「四、持久化」設定並重啟。

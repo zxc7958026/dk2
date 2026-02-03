@@ -195,6 +195,22 @@ export function updateOrderFormat(db, worldId, orderFormat) {
 }
 
 /**
+ * 更新世界「品項下拉選項」定義（來自 Excel「下拉選項」欄位）
+ * @param {import('sqlite3').Database} db
+ * @param {number} worldId
+ * @param {string|null} itemAttributeOptionsJson - JSON 字串 { [itemName]: Array<{ name, options }> }，null 表示清除
+ * @returns {Promise<void>}
+ */
+export function updateItemAttributeOptions(db, worldId, itemAttributeOptionsJson) {
+  return new Promise((resolve, reject) => {
+    db.run('UPDATE worlds SET itemAttributeOptions = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [itemAttributeOptionsJson, worldId], function (err) {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+/**
  * 更新老闆查詢顯示格式
  * @param {import('sqlite3').Database} db
  * @param {number} worldId

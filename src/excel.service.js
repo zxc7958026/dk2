@@ -41,6 +41,8 @@ export function detectExcelMapping(workbook, sheetName = null) {
     const itemKeywords = ['品項', '商品', '名稱', '項目', 'item', 'product', 'name', '商品名稱', '品項名稱'];
     const qtyKeywords = ['數量', 'qty', 'quantity'];
     const attrKeywords = ['屬性', '規格', '選項', 'attribute', 'attr', 'option', 'spec'];
+    const dropdownOptionsKeywords = ['下拉選項', '屬性格式', '屬性下拉', 'dropdown', 'options', '選項格式'];
+    let dropdownOptionsColumn = null;
 
     // 檢查第一行是否為標題
     let hasHeader = false;
@@ -67,8 +69,12 @@ export function detectExcelMapping(workbook, sheetName = null) {
         qtyColumn = XLSX.utils.encode_col(c);
         headerMatchCount++;
       }
-      if (!attrColumn && attrKeywords.some(kw => cellValue.includes(kw.toLowerCase()))) {
+      // 「屬性格式」「下拉選項」等欄位只當下拉選項用，不當成該列的屬性值；避免「屬性格式」被當成 attrColumn
+      if (!attrColumn && attrKeywords.some(kw => cellValue.includes(kw.toLowerCase())) && !dropdownOptionsKeywords.some(kw => cellValue.includes(kw.toLowerCase()))) {
         attrColumn = XLSX.utils.encode_col(c);
+      }
+      if (!dropdownOptionsColumn && dropdownOptionsKeywords.some(kw => cellValue.includes(kw.toLowerCase()))) {
+        dropdownOptionsColumn = XLSX.utils.encode_col(c);
       }
     }
 
@@ -192,6 +198,7 @@ export function detectExcelMapping(workbook, sheetName = null) {
       itemColumn,
       qtyColumn,
       attrColumn: attrColumn || null,
+      dropdownOptionsColumn: dropdownOptionsColumn || null,
       hasHeader,
       startRow: hasHeader ? 2 : 1
     };
@@ -212,6 +219,68 @@ function parseAttributes(str) {
     .split(/[,，;；\s]+/)
     .map(s => s.trim())
     .filter(Boolean);
+}
+
+/**
+ * 解析「下拉選項」儲存格：格式「名稱,選項1,選項2,...」；多個屬性用分號分隔「甜度,正常甜,半糖;冰塊,去冰,微冰」
+ * @param {string} str - 儲存格內容
+ * @returns {Array<{ name: string, options: string[] }>} 屬性與選項陣列
+ */
+function parseDropdownOptionsCell(str) {
+  if (!str || typeof str !== 'string') return [];
+  const parts = str.split(/[;；]/).map(s => s.trim()).filter(Boolean);
+  const result = [];
+  for (const part of parts) {
+    const tokens = part.split(',').map(s => s.trim()).filter(Boolean);
+    if (tokens.length === 0) continue;
+    if (tokens.length === 1) {
+      result.push({ name: tokens[0], options: [] });
+    } else {
+      result.push({ name: tokens[0], options: tokens.slice(1) });
+    }
+  }
+  return result;
+}
+
+/**
+ * 從 Excel 解析「品項 → 下拉選項定義」（依「下拉選項」欄位）
+ * 每個品項取第一筆非空的「下拉選項」作為該品項的屬性與選項。
+ * @param {Object} workbook - XLSX workbook
+ * @param {Object} mapping - { branchColumn?, itemColumn, qtyColumn, attrColumn?, dropdownOptionsColumn?, hasHeader, startRow }
+ * @param {string} sheetName - 工作表名稱（預設第一個）
+ * @returns {Object} { [itemName]: Array<{ name: string, options: string[] }> }
+ */
+export function parseExcelToItemAttributeOptions(workbook, mapping, sheetName = null) {
+  try {
+    const sheet = sheetName ? workbook.Sheets[sheetName] : workbook.Sheets[workbook.SheetNames[0]];
+    if (!sheet) return {};
+
+    const range = XLSX.utils.decode_range(sheet['!ref'] || 'A1');
+    if (range.e.c < 0 || range.e.r < 0) return {};
+
+    const dropdownColIndex = mapping.dropdownOptionsColumn !== undefined && mapping.dropdownOptionsColumn !== null
+      ? XLSX.utils.decode_col(mapping.dropdownOptionsColumn) : null;
+    if (dropdownColIndex === null) return {};
+
+    const startRow = mapping.startRow || (mapping.hasHeader ? 2 : 1);
+    const itemColIndex = XLSX.utils.decode_col(mapping.itemColumn);
+    const result = {};
+
+    for (let r = startRow - 1; r <= range.e.r; r++) {
+      const itemCell = sheet[XLSX.utils.encode_cell({ r, c: itemColIndex })];
+      const dropdownCell = sheet[XLSX.utils.encode_cell({ r, c: dropdownColIndex })];
+      const itemName = itemCell && itemCell.v !== undefined ? String(itemCell.v).trim() : '';
+      const dropdownStr = dropdownCell && dropdownCell.v !== undefined ? String(dropdownCell.v).trim() : '';
+      if (!itemName || !dropdownStr) continue;
+      if (result[itemName]) continue; // 每個品項只取第一筆非空
+      const parsed = parseDropdownOptionsCell(dropdownStr);
+      if (parsed.length > 0) result[itemName] = parsed;
+    }
+    return result;
+  } catch (err) {
+    console.error('❌ 解析 Excel 下拉選項失敗:', err);
+    return {};
+  }
 }
 
 /**

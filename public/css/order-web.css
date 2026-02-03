@@ -911,6 +911,25 @@ a.label-block {
   min-height: 40px;
 }
 
+.order-attr-cell.order-attr-dropdowns {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.order-attr-select {
+  min-width: 0;
+  min-height: 44px;
+  max-width: 180px;
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
 .order-row .label-block[style*="flex-direction:column"] {
   min-height: auto;
   padding: var(--spacing-xs) var(--spacing-sm);
@@ -1502,6 +1521,251 @@ a.label-block {
   font-weight: 600;
   color: var(--color-primary);
   margin-left: var(--spacing-sm);
+}
+
+.order-card-actions {
+  margin-top: var(--spacing-md);
+  padding-top: var(--spacing-sm);
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.btn-order-edit {
+  width: 100%;
+  min-height: var(--touch-min);
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--color-surface-elevated);
+  color: var(--color-primary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.btn-order-edit:hover {
+  background: rgba(45, 212, 191, 0.12);
+  border-color: var(--color-primary);
+}
+
+.btn-order-edit-inline {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  background: var(--color-surface-elevated);
+  color: var(--color-primary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.btn-order-edit-inline:hover {
+  background: rgba(45, 212, 191, 0.12);
+  border-color: var(--color-primary);
+}
+
+/* 訂單詳情（編輯/取消/恢復） */
+.order-detail-loading {
+  padding: var(--spacing-xl);
+  text-align: center;
+  color: var(--color-text-muted);
+}
+
+.order-detail-panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.order-detail-header {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md);
+  border-bottom: 1px solid var(--color-border-soft);
+}
+
+.order-detail-title {
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: var(--color-primary);
+  font-size: 1rem;
+}
+
+.order-detail-body {
+  padding: var(--spacing-md);
+}
+
+.order-detail-badge {
+  display: inline-block;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border-radius: var(--radius);
+  font-size: 0.875rem;
+  font-weight: 600;
+  margin-bottom: var(--spacing-sm);
+}
+
+.order-detail-badge-cancelled {
+  background: var(--color-error-bg);
+  color: var(--color-error);
+}
+
+.order-detail-meta {
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+  margin-bottom: var(--spacing-xs);
+}
+
+.order-detail-items {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-md);
+}
+
+.order-detail-item-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) 0;
+  border-bottom: 1px solid var(--color-border-soft);
+}
+
+.order-detail-item-row .item-name {
+  flex: 1;
+}
+
+.order-detail-item-editable {
+  flex-wrap: wrap;
+}
+
+.order-detail-qty-input {
+  width: 4rem;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  font-size: 1rem;
+  text-align: center;
+}
+
+.btn-order-item-delete {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  background: transparent;
+  color: var(--color-error);
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.btn-order-item-delete:hover {
+  background: var(--color-error-bg);
+}
+
+.order-detail-add-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-md);
+  padding: var(--spacing-sm) 0;
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.order-detail-add-item label {
+  width: 100%;
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+}
+
+.order-detail-menu-select {
+  width: 100%;
+  padding: var(--spacing-sm);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.order-detail-menu-select:focus {
+  border-color: var(--color-primary);
+  outline: none;
+}
+
+.order-detail-attr-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-sm);
+}
+
+.order-detail-attr-label {
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.order-detail-attr-select {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.order-detail-attr-select:focus {
+  border-color: var(--color-primary);
+  outline: none;
+}
+
+.order-detail-new-name {
+  flex: 1;
+  min-width: 120px;
+  padding: var(--spacing-sm);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  font-size: 1rem;
+}
+
+.order-detail-new-qty {
+  width: 4rem;
+  padding: var(--spacing-sm);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  font-size: 1rem;
+  text-align: center;
+}
+
+.btn-danger-outline {
+  width: 100%;
+  min-height: var(--touch-min);
+  padding: var(--spacing-md);
+  background: transparent;
+  color: var(--color-error);
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius);
+  font-size: 1rem;
+  cursor: pointer;
+  margin-top: var(--spacing-sm);
+}
+
+.btn-danger-outline:hover:not(:disabled) {
+  background: var(--color-error-bg);
+}
+
+.btn-danger-outline:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 /* 我收到的訂單 - 表格檢視 */

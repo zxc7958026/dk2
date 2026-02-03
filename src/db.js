@@ -140,6 +140,12 @@ export function initDatabase(dbPath = './orders.db') {
                 if (err) console.error('新增 excelMapping 欄位錯誤:', err);
               });
             }
+            const hasItemAttributeOptions = columns.some(col => col.name === 'itemAttributeOptions');
+            if (!hasItemAttributeOptions) {
+              db.run("ALTER TABLE worlds ADD COLUMN itemAttributeOptions TEXT", (err) => {
+                if (err) console.error('新增 itemAttributeOptions 欄位錯誤:', err);
+              });
+            }
           }
         });
       }

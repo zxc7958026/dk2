@@ -23,8 +23,8 @@ import {
 } from './order.service.js';
 import { verifyLineSignature, handleLineEvent, pushLineMessage } from './line.handler.js';
 import { getVendorByItem, getVendorMap, formatVendorMap, addItemToMenu, removeItemFromMenu, updateMenuItem, resolveVendorForItemName } from './vendorMap.service.js';
-import { getBindings, getWorldById, updateMenuImageUrl, getCurrentWorld, setCurrentWorld, createWorld, bindUserToWorld, updateWorldStatus, updateWorldName, updateOrderFormat, updateDisplayFormat, getAllWorldsForUser, getWorldByCode, getWorldMembers, unbindUserFromWorld, updateExcelMapping, getExcelMapping, getBindingByUserAndWorld } from './world.service.js';
-import { detectExcelMapping, parseExcelToVendorMap, getExcelPreview } from './excel.service.js';
+import { getBindings, getWorldById, updateMenuImageUrl, getCurrentWorld, setCurrentWorld, createWorld, bindUserToWorld, updateWorldStatus, updateWorldName, updateOrderFormat, updateDisplayFormat, getAllWorldsForUser, getWorldByCode, getWorldMembers, unbindUserFromWorld, updateExcelMapping, getExcelMapping, getBindingByUserAndWorld, updateItemAttributeOptions } from './world.service.js';
+import { detectExcelMapping, parseExcelToVendorMap, parseExcelToItemAttributeOptions, getExcelPreview } from './excel.service.js';
 import { saveVendorMap } from './vendorMap.service.js';
 import multer from 'multer';
 import { writeFile, unlink, mkdir } from 'fs/promises';
@@ -210,6 +210,26 @@ async function getAndValidateCurrentWorld(db, userId) {
   }
   
   return { worldId, binding: currentBinding };
+}
+
+/** 檢查 vendorMap 的 key 是否像 hash/userId（表示廠商欄位可能對應錯誤） */
+function vendorKeysLookLikeHash(vendorMap) {
+  if (!vendorMap || typeof vendorMap !== 'object') return false;
+  return Object.keys(vendorMap).some(k => {
+    const s = String(k).trim();
+    return /^[Uu]?[a-fA-F0-9]{32}$/.test(s) || /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-/.test(s);
+  });
+}
+
+/** 是否為建立世界時產生的範例訂單（不顯示在「我的訂單」「我收到的訂單」） */
+function isSampleOrder(newData, row) {
+  if (!newData || typeof newData !== 'object') return false;
+  const branch = (newData.branch && String(newData.branch).trim()) || '';
+  const user = (row && row.user && String(row.user).trim()) || '';
+  if (branch !== '範例世界' || user !== '媽媽') return false;
+  const items = Array.isArray(newData.items) ? newData.items : [];
+  const names = items.map(i => (i && (i.name || i.item)) && String(i.name || i.item).trim()).filter(Boolean);
+  return names.includes('牛奶') && names.includes('雞蛋');
 }
 
 // ==================== 訂單管理 API ====================
@@ -1126,6 +1146,30 @@ app.put('/api/worlds/menu-image', async (req, res) => {
   }
 });
 
+/**
+ * 檢查目前世界儲存的廠商名稱（供除錯：確認上傳菜單時「廠商欄位」對應是否正確）
+ * GET /api/worlds/menu-vendor-keys?userId=xxx
+ * 回傳 { vendorKeys: ["廠商A", "廠商B", ...] }；若為 hash/亂碼 表示上傳時廠商欄位對應錯誤
+ */
+app.get('/api/worlds/menu-vendor-keys', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) {
+      return res.status(400).json({ error: '缺少 userId' });
+    }
+    const current = await getAndValidateCurrentWorld(db, userId);
+    if (!current) {
+      return res.status(403).json({ error: '此世界尚未完成設定' });
+    }
+    const vendorMap = await getVendorMap(db, current.worldId);
+    const vendorKeys = vendorMap ? Object.keys(vendorMap) : [];
+    res.json({ vendorKeys });
+  } catch (err) {
+    console.error('❌ 取得廠商名稱列表失敗:', err);
+    res.status(500).json({ error: '取得失敗' });
+  }
+});
+
 // ==================== 世界管理 API ====================
 
 /**
@@ -1155,24 +1199,6 @@ app.post('/api/worlds', async (req, res) => {
     
     // 設定為當前世界
     await setCurrentWorld(db, userId, world.id);
-
-    // 初始化一張示範訂單（綁定到此世界）
-    try {
-      await createOrder(
-        db,
-        '範例世界', // branch：固定為「範例世界」
-        [
-          { name: '牛奶', qty: 1 },
-          { name: '雞蛋', qty: 2 }
-        ],
-        '媽媽',       // user：顯示為「媽媽」
-        world.id,     // worldId：新世界 ID
-        userId        // userId：世界擁有者
-      );
-    } catch (initErr) {
-      console.error('⚠️ 建立初始化訂單失敗（略過，不影響創建世界）:', initErr);
-      // 不 throw，避免初始化訂單失敗導致世界無法建立
-    }
 
     res.json({
       success: true,
@@ -1591,6 +1617,7 @@ app.get('/api/orders/received', async (req, res) => {
       if (orderWorldId === null || orderWorldId === undefined || orderWorldId !== current.worldId) {
         continue;
       }
+      if (isSampleOrder(newData, row)) continue;
       
       results.push({
         orderId: row.order_id,
@@ -1670,7 +1697,7 @@ app.get('/api/orders/received/export', async (req, res) => {
     
     // 取得世界的 vendorMap（用於查找廠商）
     const vendorMap = await getVendorMap(db, current.worldId);
-    
+
     // 取得啟用的欄位並保持順序
     const activeColumns = (columnConfig || defaultColumns)
       .filter(col => col.enabled !== false);
@@ -1750,6 +1777,7 @@ app.get('/api/orders/received/export', async (req, res) => {
       if (orderWorldId === null || orderWorldId === undefined || orderWorldId !== current.worldId) {
         continue;
       }
+      if (isSampleOrder(newData, row)) continue;
       
       // 將每個品項展開為一行
       for (const item of newData.items) {
@@ -1782,36 +1810,62 @@ app.get('/api/orders/received/export', async (req, res) => {
       return new Date(b.createdAt) - new Date(a.createdAt);
     });
 
-    // 產生 Excel（確保欄位順序）
-    const XLSX = (await import('xlsx')).default;
-    
-    // 建立標題列（按照使用者設定的順序）
-    const headers = activeColumns.map(col => col.label);
-    
-    // 建立資料列（按照標題順序）
-    const dataRows = results.map(row => {
-      return activeColumns.map(col => {
-        const key = col.key;
-        if (key === 'createdAt') {
-          // 格式化時間為 YYYY-MM-DD HH:mm
-          const date = new Date(row.createdAt);
-          return date.toISOString().slice(0, 16).replace('T', ' ');
+    // 使用 exceljs 產生 Excel；文字欄強制為字串格式，建立時間用本地時間
+    const ExcelJS = (await import('exceljs')).default;
+    const toCellString = (v) => {
+      if (v == null || v === '') return '';
+      if (typeof v === 'string') return v;
+      if (typeof v === 'number' && !Number.isNaN(v)) return String(v);
+      return String(v);
+    };
+    /** 建立時間：DB 存 UTC，轉成本地時區 YYYY-MM-DD HH:mm */
+    const formatCreatedAtLocal = (createdAt) => {
+      if (createdAt == null) return '';
+      const s = String(createdAt).trim();
+      if (!s) return '';
+      const utcStr = s.includes('Z') ? s : s.replace(/\s+/, 'T') + 'Z';
+      const d = new Date(utcStr);
+      if (Number.isNaN(d.getTime())) return s;
+      const Y = d.getFullYear();
+      const M = String(d.getMonth() + 1).padStart(2, '0');
+      const D = String(d.getDate()).padStart(2, '0');
+      const h = String(d.getHours()).padStart(2, '0');
+      const m = String(d.getMinutes()).padStart(2, '0');
+      return `${Y}-${M}-${D} ${h}:${m}`;
+    };
+    /** 若為 hash/userId 格式則不當成廠商名稱（避免誤對應到訂購人ID 等欄位） */
+    const sanitizeVendor = (v) => {
+      if (v == null || typeof v !== 'string') return '';
+      const s = v.trim();
+      if (/^[Uu]?[a-fA-F0-9]{32}$/.test(s) || /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-/.test(s)) return '';
+      return s;
+    };
+    const textColumnKeys = ['user', 'vendor', 'itemName', 'orderId', 'branch', 'userId', 'createdAt'];
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('訂單', { views: [{ rightToLeft: false }] });
+    const headerRow = worksheet.addRow(activeColumns.map(col => toCellString(col.label)));
+    headerRow.font = { bold: true };
+    for (const row of results) {
+      const dataRow = worksheet.addRow([]);
+      activeColumns.forEach((col, idx) => {
+        const cell = dataRow.getCell(idx + 1);
+        let val;
+        if (col.key === 'createdAt') {
+          val = formatCreatedAtLocal(row.createdAt);
+        } else if (col.key === 'vendor' || (col.label && String(col.label).trim() === '廠商')) {
+          // 不論 key 是否被改成 userId，只要「顯示名稱」是廠商就寫入廠商名稱（避免把訂單者ID 改標題為廠商卻仍寫入 ID）
+          val = sanitizeVendor(row.vendor) || (row.branch != null ? String(row.branch).trim() : '');
+        } else {
+          val = row[col.key];
         }
-        return row[key] ?? '';
+        cell.value = toCellString(val);
+        if (textColumnKeys.includes(col.key)) {
+          cell.numFmt = '@';
+        }
       });
-    });
-    
-    // 合併標題和資料
-    const worksheetData = [headers, ...dataRows];
-    
-    const ws = XLSX.utils.aoa_to_sheet(worksheetData);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, '訂單');
-    
-    // 產生 buffer
-    const excelBuffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-    
-    // 設定檔名
+    }
+    const excelBuffer = await workbook.xlsx.writeBuffer();
+
     let filename = '訂單';
     if (dateStr === '今天' || dateStr === '今日') {
       filename = `訂單_${today}.xlsx`;
@@ -1822,10 +1876,10 @@ app.get('/api/orders/received/export', async (req, res) => {
     } else {
       filename = `訂單_${today}.xlsx`;
     }
-    
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
-    res.send(excelBuffer);
+    const encodedFilename = encodeURIComponent(filename);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodedFilename}`);
+    res.send(Buffer.from(excelBuffer));
   } catch (err) {
     console.error('❌ 匯出 Excel 失敗:', err);
     res.status(500).json({ error: '匯出 Excel 時發生錯誤，請稍後再試' });
@@ -1858,7 +1912,7 @@ app.get('/api/orders/received/preview', async (req, res) => {
     
     // 取得世界的 vendorMap（用於查找廠商）
     const vendorMap = await getVendorMap(db, current.worldId);
-    
+
     // 預設欄位順序（與 Excel 匯出 / 前端設定一致）
     const defaultColumns = [
       { key: 'user', label: '訂購人', enabled: true },
@@ -1939,6 +1993,7 @@ app.get('/api/orders/received/preview', async (req, res) => {
       if (orderWorldId === null || orderWorldId === undefined || orderWorldId !== current.worldId) {
         continue;
       }
+      if (isSampleOrder(newData, row)) continue;
       
       // 將每個品項展開為一行
       for (const item of newData.items) {
@@ -2098,17 +2153,22 @@ app.get('/api/orders/my', async (req, res) => {
       }
 
       // 查詢訂單的世界資訊（顯示所有世界的訂單，但標註世界名稱）
+      // 已取消的訂單會從 orders 表刪除，故 orderItems 可能為空；改從 order_history.worldId 取得
       const orderItems = await getOrderItems(db, row.order_id);
-      if (!orderItems || orderItems.length === 0) {
-        console.log(`⚠️ 訂單 ${row.order_id} 找不到 orderItems`);
+      let orderWorldId = (orderItems && orderItems.length > 0)
+        ? orderItems[0].worldId
+        : (row.worldId !== null && row.worldId !== undefined ? row.worldId : null);
+      if (orderWorldId === null || orderWorldId === undefined) {
+        // 舊資料可能沒有 worldId，無法判斷所屬世界則略過
+        console.log(`⚠️ 訂單 ${row.order_id} 無法取得 worldId（可能為舊資料或已取消）`);
         continue;
       }
-      const orderWorldId = orderItems[0].worldId;
       
       // 如果指定了世界篩選，只保留該世界的訂單
       if (filterWorldId !== null && orderWorldId !== filterWorldId) {
         continue;
       }
+      if (isSampleOrder(newData, row)) continue;
       
       // 查詢世界資訊（名稱、代碼）
       let worldName = null;
@@ -2172,13 +2232,20 @@ app.get('/api/menu', async (req, res) => {
     const world = await getWorldById(db, current.worldId);
     const vendorMap = await getVendorMap(db, current.worldId);
     
+    let itemAttributeOptions = {};
+    if (world.itemAttributeOptions) {
+      try {
+        itemAttributeOptions = JSON.parse(world.itemAttributeOptions);
+      } catch { /* ignore */ }
+    }
     if (!vendorMap || Object.keys(vendorMap).length === 0) {
       return res.json({
         menu: null,
         formatted: '菜單為空',
         message: '老闆尚未設定菜單',
         menuImageUrl: world?.menuImageUrl || null,
-        orderFormat: null
+        orderFormat: null,
+        itemAttributeOptions
       });
     }
     
@@ -2228,7 +2295,8 @@ app.get('/api/menu', async (req, res) => {
       menuImageUrl: world?.menuImageUrl || null,
       orderFormat,
       itemImages: itemImages || {},
-      itemAttributes: Object.keys(itemAttributes).length > 0 ? itemAttributes : undefined
+      itemAttributes: Object.keys(itemAttributes).length > 0 ? itemAttributes : undefined,
+      itemAttributeOptions
     });
   } catch (err) {
     console.error('❌ 查看菜單失敗:', err);
@@ -2415,9 +2483,13 @@ app.post('/api/menu/upload-excel', upload.single('file'), async (req, res) => {
       return res.status(403).json({ error: '僅世界擁有者可以上傳 Excel 菜單' });
     }
     
-    // 讀取 Excel 檔案
+    // 讀取 Excel 檔案（UTF-8 codepage 避免廠商等中文欄位亂碼）
     const XLSX = (await import('xlsx')).default;
-    const workbook = XLSX.readFile(req.file.path);
+    try {
+      const { cptable } = await import('xlsx/dist/cpexcel.full.mjs');
+      XLSX.set_cptable(cptable);
+    } catch (_) { /* ESM 無 cptable 時略過 */ }
+    const workbook = XLSX.readFile(req.file.path, { codepage: 65001 });
     
     // 取得預覽資料
     const preview = getExcelPreview(workbook);
@@ -2455,9 +2527,26 @@ app.post('/api/menu/upload-excel', upload.single('file'), async (req, res) => {
         message: '請檢查 Excel 格式或手動設定欄位對應'
       });
     }
+    if (vendorKeysLookLikeHash(vendorMap)) {
+      return res.status(400).json({
+        error: '廠商欄位可能對應錯誤',
+        message: '偵測到似為 ID 或代碼的值。請在欄位對應中將「廠商欄位」設為實際包含廠商名稱的欄位（例如：飲料廠、便當廠），再重新上傳。',
+        needsMapping: true
+      });
+    }
     
     // 儲存 vendorMap 到當前世界
     await saveVendorMap(db, current.worldId, vendorMap);
+    
+    // 若有「下拉選項」欄位，解析並儲存品項下拉選項定義（供訂單頁屬性下拉使用）
+    const optionsMapping = {
+      ...mapping,
+      dropdownOptionsColumn: mapping.dropdownOptionsColumn ?? detectedMapping?.dropdownOptionsColumn ?? null
+    };
+    if (optionsMapping.dropdownOptionsColumn) {
+      const itemAttributeOptions = parseExcelToItemAttributeOptions(workbook, optionsMapping);
+      await updateItemAttributeOptions(db, current.worldId, Object.keys(itemAttributeOptions).length > 0 ? JSON.stringify(itemAttributeOptions) : null);
+    }
     
     // 如果偵測成功且沒有已儲存的對應，儲存欄位對應設定
     if (detectedMapping && !savedMapping) {
@@ -2530,9 +2619,13 @@ app.post('/api/menu/parse-excel', upload.single('file'), async (req, res) => {
       return res.status(403).json({ error: '僅世界擁有者可以上傳 Excel 菜單' });
     }
     
-    // 讀取 Excel 檔案
+    // 讀取 Excel 檔案（UTF-8 避免廠商欄亂碼）
     const XLSX = (await import('xlsx')).default;
-    const workbook = XLSX.readFile(req.file.path);
+    try {
+      const { cptable } = await import('xlsx/dist/cpexcel.full.mjs');
+      XLSX.set_cptable(cptable);
+    } catch (_) { /* ESM 無 cptable 時略過 */ }
+    const workbook = XLSX.readFile(req.file.path, { codepage: 65001 });
     
     // 解析 Excel
     const vendorMap = parseExcelToVendorMap(workbook, parsedMapping);
@@ -2541,7 +2634,6 @@ app.post('/api/menu/parse-excel', upload.single('file'), async (req, res) => {
     await unlink(req.file.path).catch(() => {});
     
     if (!vendorMap) {
-      // 提供更詳細的錯誤訊息
       const preview = getExcelPreview(workbook);
       const errorDetails = {
         error: '無法解析 Excel 內容，請檢查欄位對應設定',
@@ -2552,10 +2644,23 @@ app.post('/api/menu/parse-excel', upload.single('file'), async (req, res) => {
       console.error('❌ Excel 解析失敗:', errorDetails);
       return res.status(400).json(errorDetails);
     }
+    if (vendorKeysLookLikeHash(vendorMap)) {
+      return res.status(400).json({
+        error: '廠商欄位可能對應錯誤',
+        message: '偵測到似為 ID 或代碼的值。請在欄位對應中將「廠商欄位」設為實際包含廠商名稱的欄位（例如：飲料廠、便當廠），再重新上傳。',
+        needsMapping: true
+      });
+    }
     
     // 儲存 vendorMap 與欄位對應到當前世界
     await saveVendorMap(db, current.worldId, vendorMap);
     await updateExcelMapping(db, current.worldId, JSON.stringify(parsedMapping));
+    
+    // 若有「下拉選項」欄位，解析並儲存品項下拉選項定義
+    if (parsedMapping.dropdownOptionsColumn) {
+      const itemAttributeOptions = parseExcelToItemAttributeOptions(workbook, parsedMapping);
+      await updateItemAttributeOptions(db, current.worldId, Object.keys(itemAttributeOptions).length > 0 ? JSON.stringify(itemAttributeOptions) : null);
+    }
     
     res.json({
       success: true,
@@ -2600,9 +2705,13 @@ app.post('/api/menu/preview-excel', upload.single('file'), async (req, res) => {
       return res.status(403).json({ error: '僅世界擁有者可以預覽 Excel' });
     }
     
-    // 讀取 Excel 檔案
+    // 讀取 Excel 檔案（UTF-8 避免廠商欄亂碼）
     const XLSX = (await import('xlsx')).default;
-    const workbook = XLSX.readFile(req.file.path);
+    try {
+      const { cptable } = await import('xlsx/dist/cpexcel.full.mjs');
+      XLSX.set_cptable(cptable);
+    } catch (_) { /* ESM 無 cptable 時略過 */ }
+    const workbook = XLSX.readFile(req.file.path, { codepage: 65001 });
     
     // 取得預覽資料
     const preview = getExcelPreview(workbook);
@@ -3015,8 +3124,6 @@ app.get('/api/auth/line-login', (req, res) => {
     return res.status(500).send('LINE Login 未設定，請設定 .env');
   }
 
-  console.log('📤 LINE Login redirect_uri:', LINE_LOGIN_REDIRECT_URI);
-
   const authUrl = `https://access.line.me/oauth2/v2.1/authorize?` +
     `response_type=code&` +
     `client_id=${LINE_LOGIN_CHANNEL_ID}&` +
@@ -3024,6 +3131,10 @@ app.get('/api/auth/line-login', (req, res) => {
     `state=${state}&` +
     `scope=profile%20openid&` +
     `bot_prompt=aggressive`;
+
+  // 除錯：若 LINE 回 400，比對此 URL 的 redirect_uri 與 LINE 後台是否一字不差
+  console.log('📤 LINE Login redirect_uri:', LINE_LOGIN_REDIRECT_URI);
+  console.log('📤 LINE Login 完整授權 URL (state 已遮):', authUrl.replace(state, '[STATE]'));
 
   res.redirect(authUrl);
 });

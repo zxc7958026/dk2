@@ -39,6 +39,7 @@ const state = {
   formatted: null, // 菜單文字（API formatted）
   orderFormat: null, // owner 設定的訂購格式 { requiredFields?, itemFormat? }
   itemImages: {}, // { [vendor]: { [itemName]: imageUrl } } 品項圖片
+  itemAttributeOptions: {}, // Excel「下拉選項」欄位解析結果 { [itemName]: [{ name, options }] }
   
   // 下單流程狀態（無選擇分店頁，直接訂單頁）
   selectedItems: [], // [{ name: string, qty: number, attributes: string[] }]
@@ -54,7 +55,7 @@ const state = {
   excelPreview: null,
   excelDetectedMapping: null,
   excelNeedsMapping: false,
-  excelMapping: { itemColumn: '', qtyColumn: '', attrColumn: '', hasHeader: true, startRow: 2 },
+  excelMapping: { branchColumn: '', itemColumn: '', qtyColumn: '', attrColumn: '', dropdownOptionsColumn: '', hasHeader: true, startRow: 2 },
   worlds: [], // [{ id, name }] 我的世界列表
   
   // 我的訂單
@@ -85,7 +86,15 @@ const state = {
   errorMessage: null,
 
   // 世界管理：退出世界模式
-  leaveWorldMode: false
+  leaveWorldMode: false,
+
+  // 訂單詳情（編輯/取消/恢復）
+  orderDetailOrderId: null,
+  orderDetailOrder: null,   // 列表的訂單資料（用於已取消時顯示）
+  orderDetailFetched: null, // null | { orderId, branch, items: [{id, item, qty}], created_at } | 'cancelled'
+  orderDetailTab: null,     // 'my_orders' | 'received_orders'
+  orderDetailSelectedMenuItem: '',  // 新增品項時選的菜單品項名稱，'' = 其他
+  orderDetailNewItemAttrs: []       // 新增品項時選的屬性值 [val1, val2, ...]
 };
 
 // ==================== API 封裝 ====================
@@ -168,7 +177,9 @@ async function fetchMenu(userId) {
       menuImageUrl: data.menuImageUrl,
       formatted: data.formatted,
       orderFormat: data.orderFormat || null,
-      itemImages: data.itemImages || {}
+      itemImages: data.itemImages || {},
+      itemAttributeOptions: data.itemAttributeOptions || {},
+      itemAttributes: data.itemAttributes
     };
   } catch (error) {
     console.error('❌ 取得菜單失敗:', error);
@@ -203,6 +214,21 @@ async function createOrder(userId, items, userName = null) {
     console.error('❌ 建立訂單失敗:', error);
     throw error;
   }
+}
+
+/**
+ * 取得單筆訂單詳情（可編輯狀態）
+ * @returns {Promise<{orderId, branch, items: [{id, item, qty}], created_at}|null>} 404 時回傳 null
+ */
+async function fetchOrderDetail(orderId) {
+  if (!state.userId) return null;
+  const response = await fetch(`${API_BASE}/orders/${orderId}?userId=${encodeURIComponent(state.userId)}`);
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || '查詢訂單失敗');
+  }
+  return await response.json();
 }
 
 // ==================== LINE Login 整合 ====================
@@ -403,6 +429,7 @@ async function loadMenu(useMockIfFail = false) {
     state.itemImages = {};
     state.vendorItemMap = {};
     state.baseItemToMenuMap = {};
+    state.itemAttributeOptions = {};
     return;
   }
   
@@ -418,6 +445,7 @@ async function loadMenu(useMockIfFail = false) {
       state.orderFormat = menuData.orderFormat || null;
       state.itemImages = menuData.itemImages || {};
       state.itemAttributes = menuData.itemAttributes || {};
+      state.itemAttributeOptions = menuData.itemAttributeOptions || {};
       // 建立 vendorItemMap 供訂單建立時使用
       state.vendorItemMap = {};
       // 建立 menuItemAttributes：從 menu 或 itemAttributes 提取品項對應的屬性
@@ -442,6 +470,7 @@ async function loadMenu(useMockIfFail = false) {
       state.vendorItemMap = {};
       state.menuItemAttributes = {};
       state.baseItemToMenuMap = {};
+      state.itemAttributeOptions = {};
     }
     // 建立 orderFormat 品項名稱到菜單實際品項名稱的映射
     if (state.menu && state.orderFormat && state.orderFormat.items && Array.isArray(state.orderFormat.items)) {
@@ -531,6 +560,7 @@ async function loadMenu(useMockIfFail = false) {
       state.vendorItemMap = {};
       state.menuItemAttributes = {};
       state.baseItemToMenuMap = {};
+      state.itemAttributeOptions = {};
       state.formatItemToMenuMap = {};
     setLoading(false);
     
@@ -941,6 +971,88 @@ function renderOrderPage(container) {
   }
 }
 
+/**
+ * 取得品項的屬性維度名稱與各維度選項（供下拉選單用）
+ * @param {string} itemName - 品項基礎名稱
+ * @returns {{ dimensionNames: string[], optionsPerDimension: string[][] }}
+ */
+/** 從 state.itemAttributeOptions 取得該品項的定義（支援 trim 比對 key） */
+function getItemAttributeOptions(itemName) {
+  if (!state.itemAttributeOptions || typeof state.itemAttributeOptions !== 'object') return null;
+  const key = (itemName || '').trim();
+  if (state.itemAttributeOptions[key] && Array.isArray(state.itemAttributeOptions[key])) return state.itemAttributeOptions[key];
+  const matchedKey = Object.keys(state.itemAttributeOptions).find(k => (k || '').trim() === key);
+  return matchedKey && Array.isArray(state.itemAttributeOptions[matchedKey]) ? state.itemAttributeOptions[matchedKey] : null;
+}
+
+function getAttributeDimensionsAndOptions(itemName) {
+  const dimensionNames = [];
+  const optionsByIndex = {}; // index -> Set of option strings
+
+  // 維度名稱與選項：來自 orderFormat.items 中該品項的 attributes（支援「名稱,選項1,選項2」存的 options）
+  const formatOptionsByIndex = []; // 從 orderFormat 來的選項，優先使用
+  if (state.orderFormat && state.orderFormat.items && Array.isArray(state.orderFormat.items)) {
+    const formatItem = state.orderFormat.items.find(item => (item.name || '').trim() === (itemName || '').trim());
+    if (formatItem && formatItem.attributes && Array.isArray(formatItem.attributes)) {
+      formatItem.attributes.forEach(a => {
+        const name = (typeof a === 'object' && a && a.name) ? a.name : String(a || '');
+        dimensionNames.push(name);
+        const opts = (typeof a === 'object' && a && Array.isArray(a.options)) ? a.options : [];
+        formatOptionsByIndex.push(opts.length ? opts : null); // null = 從 menu 推
+      });
+    }
+  }
+
+  // 從 menu 收集各維度的選項：品項名為 "baseName 屬性1 屬性2 ..."（僅當該維度沒有 format 選項時用）
+  const menuItemName = (state.baseItemToMenuMap && state.baseItemToMenuMap[itemName]) || itemName;
+  if (state.menu) {
+    for (const vendor of Object.keys(state.menu)) {
+      for (const fullName of Object.keys(state.menu[vendor])) {
+        if (fullName === itemName || fullName === menuItemName) continue;
+        const prefix = itemName + ' ';
+        const prefixMenu = menuItemName + ' ';
+        if (!fullName.startsWith(prefix) && !fullName.startsWith(prefixMenu)) continue;
+        const suffix = fullName.startsWith(prefix) ? fullName.slice(prefix.length) : fullName.slice(prefixMenu.length);
+        const parts = suffix.split(/\s+/).filter(Boolean);
+        parts.forEach((p, i) => {
+          if (!optionsByIndex[i]) optionsByIndex[i] = new Set();
+          optionsByIndex[i].add(p);
+        });
+      }
+    }
+  }
+
+  // 若沒有 orderFormat 維度，改用 Excel「下拉選項」欄位（itemAttributeOptions）
+  const excelAttrs = getItemAttributeOptions(itemName);
+  if (dimensionNames.length === 0 && excelAttrs && excelAttrs.length > 0) {
+    excelAttrs.forEach(a => {
+      dimensionNames.push(a.name || '');
+      formatOptionsByIndex.push((a.options && a.options.length) ? a.options : null);
+    });
+  }
+  // 若仍無維度，用索引當維度（屬性1、屬性2…）並依 menu 推斷維度數
+  const maxIndex = Math.max(-1, ...Object.keys(optionsByIndex).map(Number));
+  if (dimensionNames.length === 0 && maxIndex >= 0) {
+    for (let i = 0; i <= maxIndex; i++) dimensionNames.push('屬性' + (i + 1));
+  }
+  // Excel「下拉選項」可補齊：orderFormat 有維度名稱但沒選項時，用 itemAttributeOptions 同名稱的 options
+  const excelOpts = getItemAttributeOptions(itemName);
+  if (excelOpts && Array.isArray(excelOpts) && excelOpts.length > 0) {
+    dimensionNames.forEach((dimName, i) => {
+      if (formatOptionsByIndex[i] && formatOptionsByIndex[i].length > 0) return;
+      const match = excelOpts.find(a => (a.name || '').trim() === (dimName || '').trim());
+      if (match && match.options && match.options.length > 0) {
+        formatOptionsByIndex[i] = match.options;
+      }
+    });
+  }
+  const optionsPerDimension = dimensionNames.map((_, i) => {
+    if (formatOptionsByIndex[i] && formatOptionsByIndex[i].length > 0) return formatOptionsByIndex[i];
+    return optionsByIndex[i] ? Array.from(optionsByIndex[i]).sort() : [];
+  });
+  return { dimensionNames, optionsPerDimension };
+}
+
 /** 依 owner 設定的 orderFormat 顯示屬性（requiredFields） */
 function formatAttributeLabel() {
   const of = state.orderFormat;
@@ -1108,10 +1220,10 @@ function renderItemSelection(container) {
         <div class="label-block">訂購品項</div>
       </div>
       <!-- 簡化流程：直接顯示品項列表，不依賴 orderFormat -->
-      <div class="order-rows ${(state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) ? 'order-rows-with-attr' : ''}">
+      <div class="order-rows ${(state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) || (state.itemAttributeOptions && Object.keys(state.itemAttributeOptions).length > 0) ? 'order-rows-with-attr' : ''}">
         <div class="order-row order-rows-head">
           <div class="label-block">品項</div>
-          ${(state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) ? '<div class="label-block">屬性</div>' : ''}
+          ${(state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) || (state.itemAttributeOptions && Object.keys(state.itemAttributeOptions).length > 0) ? '<div class="label-block">屬性</div>' : ''}
           <div class="label-block">數量</div>
         </div>
         ${(() => {
@@ -1206,14 +1318,27 @@ function renderItemSelection(container) {
               itemImageUrl = state.itemImages[menuInfo.vendor][menuItemName];
             }
             
-            const hasAttr = state.menuItemAttributes && state.menuItemAttributes[menuItemName] && state.menuItemAttributes[menuItemName].length > 0;
+            const hasAttr = (state.menuItemAttributes && state.menuItemAttributes[menuItemName] && state.menuItemAttributes[menuItemName].length > 0) || (getItemAttributeOptions(itemName) && getItemAttributeOptions(itemName).length > 0);
             const attrs = (selectedItem.attributes || []);
-            const attrCell = hasAttr ? `
+            const { dimensionNames, optionsPerDimension } = getAttributeDimensionsAndOptions(itemName);
+            const useDropdowns = dimensionNames.length > 0 && optionsPerDimension.some(opts => opts.length > 0);
+            const attrCell = hasAttr ? (useDropdowns ? `
+                <div class="order-attr-cell order-attr-dropdowns">
+                  ${dimensionNames.map((dimName, di) => {
+                    const options = optionsPerDimension[di] || [];
+                    const currentVal = attrs[di] || '';
+                    return `<select class="order-attr-select" data-item-id="${safeId}" data-attr-index="${di}" data-attr-name="${escapeHtml(dimName)}" onchange="orderWeb.setItemAttributeFromSelect(this)" title="${escapeHtml(dimName)}">
+                      <option value="">-- ${escapeHtml(dimName)} --</option>
+                      ${options.map(v => `<option value="${escapeHtml(v)}" ${currentVal === v ? 'selected' : ''}>${escapeHtml(v)}</option>`).join('')}
+                    </select>`;
+                  }).join('')}
+                </div>
+              ` : `
                 <div class="order-attr-cell">
                   ${attrs.map((a, ai) => `<span class="attr-tag">${escapeHtml(a)}<button type="button" class="attr-tag-remove" onclick="orderWeb.removeItemAttributeById('${safeId}', ${ai})" aria-label="移除">×</button></span>`).join('')}
                   <button type="button" class="btn-attr-plus" onclick="orderWeb.addItemAttribute('${safeId}')" title="新增屬性">＋</button>
                 </div>
-              ` : ((state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) ? '<div class="order-attr-cell">－</div>' : '');
+              `) : (((state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) || (state.itemAttributeOptions && Object.keys(state.itemAttributeOptions).length > 0)) ? '<div class="order-attr-cell">－</div>' : '');
             
             return `
               <div class="order-row">
@@ -1272,7 +1397,7 @@ function renderConfirmOrder(container) {
   
   const totalQty = validItems.reduce((sum, item) => sum + item.qty, 0);
   const purchaserName = state.purchaserName || '－';
-  const hasAnyAttr = (state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0);
+  const hasAnyAttr = (state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) || (state.itemAttributeOptions && Object.keys(state.itemAttributeOptions).length > 0);
   
   container.innerHTML = `
     <div class="page-order">
@@ -1462,6 +1587,21 @@ function goToConfirm() {
     showError('請至少選擇一個品項');
     return;
   }
+  // 有屬性的品項必須選完屬性才能確認
+  for (const item of validItems) {
+    const { dimensionNames, optionsPerDimension } = getAttributeDimensionsAndOptions(item.name);
+    const requiredCount = optionsPerDimension.filter(opts => opts && opts.length > 0).length;
+    if (requiredCount === 0) continue;
+    const attrs = item.attributes || [];
+    for (let i = 0; i < requiredCount; i++) {
+      const val = (attrs[i] != null ? String(attrs[i]) : '').trim();
+      if (!val) {
+        const dimName = dimensionNames[i] || ('屬性' + (i + 1));
+        showError(`請為「${item.name}」選擇${dimName}後再確認訂單`);
+        return;
+      }
+    }
+  }
   state.currentStep = 'confirm';
   render();
 }
@@ -1572,6 +1712,45 @@ function addItemAttribute(itemIdOrName) {
     }
     render();
   }
+}
+
+/**
+ * 從下拉選單設定品項屬性（用於訂購品項的屬性 <select>）
+ */
+function setItemAttributeFromSelect(selectEl) {
+  const itemId = selectEl.getAttribute('data-item-id');
+  const attrIndex = parseInt(selectEl.getAttribute('data-attr-index'), 10);
+  const attrValue = (selectEl.value || '').trim();
+  if (itemId == null || isNaN(attrIndex) || attrIndex < 0) return;
+  let idx = state.selectedItems.findIndex(item => item.id === itemId);
+  if (idx < 0) idx = state.selectedItems.findIndex(item => item.name === itemId);
+  const orderFormat = state.orderFormat;
+  const formatAttributes = orderFormat && orderFormat.items && orderFormat.items.length > 0
+    ? (orderFormat.items[0].attributes || [])
+    : [];
+  if (idx >= 0) {
+    if (!state.selectedItems[idx].attributes) state.selectedItems[idx].attributes = [];
+    while (state.selectedItems[idx].attributes.length <= attrIndex) {
+      state.selectedItems[idx].attributes.push('');
+    }
+    state.selectedItems[idx].attributes[attrIndex] = attrValue;
+    if (!state.selectedItems[idx].id) {
+      state.selectedItems[idx].id = `item_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+  } else {
+    let itemName = itemId;
+    const existingItem = state.selectedItems.find(item => item.id === itemId);
+    if (existingItem) itemName = existingItem.name;
+    const attributes = new Array(Math.max(formatAttributes.length, attrIndex + 1)).fill('');
+    attributes[attrIndex] = attrValue;
+    state.selectedItems.push({
+      id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      name: itemName,
+      qty: 0,
+      attributes
+    });
+  }
+  render();
 }
 
 /**
@@ -2043,6 +2222,16 @@ function goMembers() {
  * 渲染我的訂單頁面
  */
 function renderMyOrdersPage(container) {
+  if (state.orderDetailOrderId != null) {
+    container.innerHTML = `
+    <div class="page-order">
+      ${renderOrderDetailView()}
+    </div>
+    ${navBottom()}
+    `;
+    return;
+  }
+
   const orders = state.myOrders || [];
   const dateStr = state.myOrdersDate || '今天';
   const currentTab = state.myOrdersTab || 'my_orders';
@@ -2156,6 +2345,9 @@ function renderMyOrdersPage(container) {
                       </div>
                     `;
                     }).join('')}
+                  </div>
+                  <div class="order-card-actions">
+                    <button type="button" class="btn-order-edit" onclick="orderWeb.openOrderDetailByOrderId(${order.orderId})">查看／編輯</button>
                   </div>
                 </div>
               `).join('')}
@@ -2411,7 +2603,6 @@ function saveExcelExportColumns() {
   }
   
   try {
-    // 如果有正在編輯的欄位，先儲存它
     if (state.excelExportColumnEditing) {
       saveExcelColumnLabel(state.excelExportColumnEditing);
     }
@@ -2459,12 +2650,10 @@ function saveExcelExportColumns() {
  * 開啟 Excel 匯出欄位設定對話框
  */
 function openExcelExportColumnsDialog() {
-  // 載入設定
   const saved = loadExcelExportColumns();
   if (saved) {
     state.excelExportColumns = saved;
   } else {
-    // 使用預設
     state.excelExportColumns = [
       { key: 'orderId', label: '訂單ID', enabled: true },
       { key: 'itemName', label: '品項名稱', enabled: true },
@@ -2476,8 +2665,6 @@ function openExcelExportColumnsDialog() {
   }
   state.excelExportColumnsDialogOpen = true;
   render();
-  
-  // 設定拖曳功能
   setTimeout(() => {
     setupExcelExportColumnsDragAndDrop();
   }, 100);
@@ -2799,9 +2986,11 @@ function renderReceivedOrdersTable() {
     return '<div class="empty-message">尚無訂單</div>';
   }
 
-  const headerHtml = columns.map(col => `<th>${escapeHtml(col.label)}</th>`).join('');
-
+  const headerHtml = columns.map(col => `<th>${escapeHtml(col.label)}</th>`).join('') + '<th>操作</th>';
+  const orderIdSeen = {};
   const bodyHtml = rows.map(row => {
+    const isFirstOfOrder = !orderIdSeen[row.orderId];
+    if (isFirstOfOrder) orderIdSeen[row.orderId] = true;
     const tds = columns.map(col => {
       const key = col.key;
       let value = row[key];
@@ -2811,7 +3000,10 @@ function renderReceivedOrdersTable() {
       if (value === null || value === undefined) value = '';
       return `<td>${escapeHtml(String(value))}</td>`;
     }).join('');
-    return `<tr>${tds}</tr>`;
+    const actionTd = isFirstOfOrder
+      ? `<td><button type="button" class="btn-order-edit-inline" onclick="orderWeb.openOrderDetailByOrderId(${row.orderId})">編輯</button></td>`
+      : '<td></td>';
+    return `<tr>${tds}${actionTd}</tr>`;
   }).join('');
 
   return `
@@ -2853,6 +3045,445 @@ function setMyOrdersWorld(worldId) {
     fetchReceivedOrders();
   } else {
     fetchMyOrders();
+  }
+}
+
+/**
+ * 從「我收到的訂單」表格依 orderId 組成一筆訂單（供開啟詳情用）
+ */
+function buildOrderFromTableRows(orderId) {
+  const rows = state.receivedOrdersTableRows || [];
+  const same = rows.filter(r => r.orderId === orderId);
+  if (same.length === 0) return null;
+  const first = same[0];
+  return {
+    orderId: first.orderId,
+    user: first.user,
+    createdAt: first.createdAt,
+    items: same.map(r => ({ name: r.itemName, qty: r.qty }))
+  };
+}
+
+/**
+ * 開啟訂單詳情（從卡片傳入完整 order）
+ */
+async function openOrderDetail(order, tab) {
+  if (!order || !order.orderId) return;
+  state.orderDetailOrderId = order.orderId;
+  state.orderDetailOrder = order;
+  state.orderDetailTab = tab || state.myOrdersTab;
+  state.orderDetailFetched = null;
+  state.errorMessage = null;
+  setLoading(true);
+  render();
+  try {
+    const [orderData, _] = await Promise.all([
+      fetchOrderDetail(order.orderId).then(d => d || 'cancelled'),
+      (!state.menu && state.userId) ? fetchMenu(state.userId).then(d => {
+        state.menu = d.menu;
+        state.orderFormat = d.orderFormat || null;
+        state.itemAttributeOptions = d.itemAttributeOptions || {};
+        state.itemAttributes = d.itemAttributes || {};
+        state.menuItemAttributes = {};
+        if (state.menu && typeof state.menu === 'object') {
+          for (const vendor of Object.keys(state.menu)) {
+            for (const itemName of Object.keys(state.menu[vendor])) {
+              const val = state.menu[vendor][itemName];
+              if (typeof val === 'object' && val !== null && Array.isArray(val.attributes) && val.attributes.length > 0) {
+                state.menuItemAttributes[itemName] = val.attributes;
+              } else if (state.itemAttributes[vendor] && state.itemAttributes[vendor][itemName]) {
+                state.menuItemAttributes[itemName] = state.itemAttributes[vendor][itemName];
+              }
+            }
+          }
+        }
+      }).catch(() => {}) : Promise.resolve()
+    ]);
+    state.orderDetailFetched = orderData;
+  } catch (e) {
+    state.errorMessage = e.message || '無法載入訂單';
+    state.orderDetailFetched = 'error';
+  } finally {
+    setLoading(false);
+    render();
+  }
+}
+
+/**
+ * 開啟訂單詳情（從表格或卡片只傳 orderId）
+ */
+async function openOrderDetailByOrderId(orderId, tab) {
+  const tabName = tab || state.myOrdersTab;
+  const isTable = tabName === 'received_orders' && state.myOrdersReceivedViewMode === 'table' && state.receivedOrdersTableRows;
+  const order = isTable
+    ? buildOrderFromTableRows(orderId)
+    : (state.myOrders || []).find(o => o.orderId === orderId);
+  const fallback = { orderId, items: [], createdAt: '', user: '' };
+  await openOrderDetail(order || fallback, tabName);
+}
+
+/**
+ * 訂單詳情：變更「新增品項」的菜單選擇（選菜單品項 or 其他）
+ */
+function setOrderDetailSelectedMenuItem(value) {
+  state.orderDetailSelectedMenuItem = (value || '').trim();
+  state.orderDetailNewItemAttrs = [];
+  render();
+}
+
+/**
+ * 訂單詳情：設定新增品項的某個屬性值
+ */
+function setOrderDetailNewItemAttr(dimIndex, value) {
+  if (!Array.isArray(state.orderDetailNewItemAttrs)) state.orderDetailNewItemAttrs = [];
+  state.orderDetailNewItemAttrs[dimIndex] = value || '';
+  render();
+}
+
+/**
+ * 取得當前世界菜單的品項列表（供訂單詳情「新增品項」下拉用）
+ * @returns {{ value: string, label: string }[]}
+ */
+function getOrderDetailMenuOptions() {
+  const menu = state.menu;
+  if (!menu || typeof menu !== 'object') return [];
+  const options = [];
+  for (const vendor of Object.keys(menu)) {
+    const items = menu[vendor];
+    if (!items || typeof items !== 'object') continue;
+    for (const itemName of Object.keys(items)) {
+      options.push({ value: itemName, label: `${vendor} － ${itemName}` });
+    }
+  }
+  return options.sort((a, b) => a.label.localeCompare(b.label, 'zh-Hant'));
+}
+
+/**
+ * 關閉訂單詳情
+ */
+function closeOrderDetail() {
+  state.orderDetailOrderId = null;
+  state.orderDetailOrder = null;
+  state.orderDetailFetched = null;
+  state.orderDetailTab = null;
+  state.orderDetailSelectedMenuItem = '';
+  state.orderDetailNewItemAttrs = [];
+  state.errorMessage = null;
+  render();
+  // 重新載入列表以反映修改
+  if (state.myOrdersTab === 'my_orders') fetchMyOrders();
+  else fetchReceivedOrders();
+}
+
+/**
+ * 渲染訂單詳情區塊（可編輯 / 已取消+恢復）
+ */
+function renderOrderDetailView() {
+  const id = state.orderDetailOrderId;
+  const order = state.orderDetailOrder;
+  const fetched = state.orderDetailFetched;
+  const tab = state.orderDetailTab;
+
+  if (!id || fetched === null) {
+    return '<div class="order-detail-loading">載入中...</div>';
+  }
+  if (fetched === 'error') {
+    return `
+      <div class="order-detail-panel">
+        <div class="order-detail-header">
+          <button type="button" class="btn-back" onclick="orderWeb.closeOrderDetail()">← 返回</button>
+          <span class="order-detail-title">訂單 #${id}</span>
+        </div>
+        <div class="order-detail-body">
+          <p class="error-message">${escapeHtml(state.errorMessage || '載入失敗')}</p>
+        </div>
+      </div>
+    `;
+  }
+
+  const isCancelled = fetched === 'cancelled';
+  const displayName = state.lineProfile?.displayName || state.userId || '';
+
+  if (isCancelled) {
+    const items = (order && order.items) || [];
+    return `
+      <div class="order-detail-panel">
+        <div class="order-detail-header">
+          <button type="button" class="btn-back" onclick="orderWeb.closeOrderDetail()">← 返回</button>
+          <span class="order-detail-title">訂單 #${id}</span>
+        </div>
+        <div class="order-detail-body">
+          <p class="order-detail-badge order-detail-badge-cancelled">已取消</p>
+          ${order && order.createdAt ? `<p class="order-detail-meta">建立時間：${formatDateTime(order.createdAt)}</p>` : ''}
+          ${order && order.user ? `<p class="order-detail-meta">下單者：${escapeHtml(order.user)}</p>` : ''}
+          <div class="order-detail-items">
+            ${items.map(item => `
+              <div class="order-detail-item-row">
+                <span class="item-name">${escapeHtml(item.name || item.item || '')}</span>
+                <span class="item-qty">x${item.qty || 0}</span>
+              </div>
+            `).join('')}
+          </div>
+          <button type="button" class="btn-block btn-primary" onclick="orderWeb.restoreOrder()" ${state.isLoading ? 'disabled' : ''}>
+            ${state.isLoading ? '處理中...' : '恢復訂單'}
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  const items = fetched.items || [];
+  const userName = displayName;
+
+  const itemsHtml = items.map(it => `
+    <div class="order-detail-item-row order-detail-item-editable" data-item-id="${it.id}">
+      <span class="item-name">${escapeHtml(it.item || '')}</span>
+      <input type="number" min="1" max="999999" value="${it.qty}" 
+             onchange="orderWeb.updateOrderItemQty(${it.id}, parseInt(this.value, 10) || 1)"
+             class="order-detail-qty-input">
+      <button type="button" class="btn-order-item-delete" onclick="orderWeb.deleteOrderItem(${it.id})" title="刪除此品項">刪除</button>
+    </div>
+  `).join('');
+
+  return `
+    <div class="order-detail-panel">
+      <div class="order-detail-header">
+        <button type="button" class="btn-back" onclick="orderWeb.closeOrderDetail()">← 返回</button>
+        <span class="order-detail-title">訂單 #${id}</span>
+      </div>
+      <div class="order-detail-body">
+        <p class="order-detail-meta">建立時間：${formatDateTime(fetched.created_at)}</p>
+        ${tab === 'received_orders' && order && order.user ? `<p class="order-detail-meta">下單者：${escapeHtml(order.user)}</p>` : ''}
+        <div class="order-detail-items">${itemsHtml}</div>
+        <div class="order-detail-add-item">
+          <label>新增品項（從該世界菜單選擇）</label>
+          ${(function() {
+            const menuOpts = getOrderDetailMenuOptions();
+            if (menuOpts.length > 0) {
+              return `
+                <select id="order-detail-menu-select" class="order-detail-menu-select" onchange="orderWeb.setOrderDetailSelectedMenuItem(this.value)">
+                  <option value="" ${state.orderDetailSelectedMenuItem === '' ? 'selected' : ''}>請選擇品項</option>
+                  ${menuOpts.map(o => `<option value="${escapeHtml(o.value)}" ${state.orderDetailSelectedMenuItem === o.value ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}
+                </select>
+              `;
+            }
+            return '';
+          })()}
+          ${(function() {
+            const menuOpts = getOrderDetailMenuOptions();
+            if (menuOpts.length > 0 && state.orderDetailSelectedMenuItem) {
+              const itemName = state.orderDetailSelectedMenuItem;
+              const { dimensionNames, optionsPerDimension } = getAttributeDimensionsAndOptions(itemName);
+              const hasAttr = dimensionNames.length > 0 && optionsPerDimension.some(opts => opts && opts.length > 0);
+              if (hasAttr) {
+                const attrs = state.orderDetailNewItemAttrs || [];
+                return `
+                  <div class="order-detail-attr-row">
+                    <span class="order-detail-attr-label">屬性：</span>
+                    ${dimensionNames.map((dimName, di) => {
+                      const options = optionsPerDimension[di] || [];
+                      const currentVal = attrs[di] || '';
+                      return `<select class="order-detail-attr-select" data-attr-index="${di}" onchange="orderWeb.setOrderDetailNewItemAttr(${di}, this.value)">
+                        <option value="">-- ${escapeHtml(dimName)} --</option>
+                        ${options.map(v => `<option value="${escapeHtml(v)}" ${currentVal === v ? 'selected' : ''}>${escapeHtml(v)}</option>`).join('')}
+                      </select>`;
+                    }).join('')}
+                  </div>
+                `;
+              }
+            }
+            return '';
+          })()}
+          <input type="number" min="1" max="999999" id="order-detail-new-item-qty" value="1" class="order-detail-new-qty">
+          <button type="button" class="btn-secondary" onclick="orderWeb.addOrderItemFromInput()">新增</button>
+        </div>
+        <button type="button" class="btn-block btn-danger-outline" onclick="orderWeb.cancelOrderConfirm()" ${state.isLoading ? 'disabled' : ''}>
+          取消此訂單
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+/**
+ * 更新訂單品項數量
+ */
+async function updateOrderItemQty(itemId, qty) {
+  if (!state.userId || !state.orderDetailOrderId) return;
+  setLoading(true);
+  try {
+    const res = await fetch(`${API_BASE}/orders/items/${itemId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        qty,
+        userId: state.userId,
+        user: state.lineProfile?.displayName || null
+      })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || '更新數量失敗');
+    }
+    state.orderDetailFetched = await fetchOrderDetail(state.orderDetailOrderId);
+    render();
+  } catch (e) {
+    showError(e.message || '更新數量失敗');
+  } finally {
+    setLoading(false);
+    render();
+  }
+}
+
+/**
+ * 刪除訂單品項
+ */
+async function deleteOrderItem(itemId) {
+  if (!state.userId || !confirm('確定要刪除此品項？')) return;
+  setLoading(true);
+  try {
+    const res = await fetch(`${API_BASE}/orders/items/${itemId}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: state.userId,
+        user: state.lineProfile?.displayName || null
+      })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || '刪除失敗');
+    }
+    const data = await fetchOrderDetail(state.orderDetailOrderId);
+    if (data && data.items && data.items.length === 0) {
+      closeOrderDetail();
+      return;
+    }
+    state.orderDetailFetched = data || 'cancelled';
+    render();
+  } catch (e) {
+    showError(e.message || '刪除失敗');
+  } finally {
+    setLoading(false);
+    render();
+  }
+}
+
+/**
+ * 從菜單選擇（含屬性）取得名稱與數量並新增品項
+ */
+async function addOrderItemFromInput() {
+  const selectEl = document.getElementById('order-detail-menu-select');
+  const qtyEl = document.getElementById('order-detail-new-item-qty');
+  if (!qtyEl || !state.userId || !state.orderDetailOrderId) return;
+
+  const baseName = (state.orderDetailSelectedMenuItem || '').trim();
+  const attrs = (state.orderDetailNewItemAttrs || []).filter(Boolean);
+  const name = baseName ? (attrs.length > 0 ? `${baseName} ${attrs.join(' ')}` : baseName) : '';
+
+  const qty = parseInt(qtyEl.value, 10) || 1;
+  if (!name) {
+    showError('請從菜單選擇品項');
+    return;
+  }
+
+  setLoading(true);
+  try {
+    const res = await fetch(`${API_BASE}/orders/${state.orderDetailOrderId}/items`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        qty,
+        userId: state.userId,
+        user: state.lineProfile?.displayName || null
+      })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || '新增品項失敗');
+    }
+    state.orderDetailFetched = await fetchOrderDetail(state.orderDetailOrderId);
+    state.orderDetailSelectedMenuItem = '';
+    state.orderDetailNewItemAttrs = [];
+    if (selectEl) selectEl.value = '';
+    qtyEl.value = '1';
+    render();
+  } catch (e) {
+    showError(e.message || '新增品項失敗');
+  } finally {
+    setLoading(false);
+    render();
+  }
+}
+
+/**
+ * 取消訂單（先確認）
+ */
+function cancelOrderConfirm() {
+  if (!confirm('確定要取消此訂單？取消後可再恢復。')) return;
+  cancelOrder();
+}
+
+async function cancelOrder() {
+  if (!state.userId || !state.orderDetailOrderId) return;
+  setLoading(true);
+  try {
+    const res = await fetch(`${API_BASE}/orders/${state.orderDetailOrderId}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: state.userId,
+        user: state.lineProfile?.displayName || null
+      })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || '取消訂單失敗');
+    }
+    const prevItems = (state.orderDetailFetched && state.orderDetailFetched !== 'cancelled' && state.orderDetailFetched.items)
+      ? state.orderDetailFetched.items.map(i => ({ name: i.item, qty: i.qty }))
+      : (state.orderDetailOrder && state.orderDetailOrder.items) || [];
+    state.orderDetailFetched = 'cancelled';
+    state.orderDetailOrder = { ...state.orderDetailOrder, orderId: state.orderDetailOrderId, items: prevItems };
+    render();
+  } catch (e) {
+    showError(e.message || '取消訂單失敗');
+  } finally {
+    setLoading(false);
+    render();
+  }
+}
+
+/**
+ * 恢復已取消的訂單
+ */
+async function restoreOrder() {
+  if (!state.userId || !state.orderDetailOrderId) return;
+  setLoading(true);
+  try {
+    const res = await fetch(`${API_BASE}/orders/${state.orderDetailOrderId}/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: state.userId,
+        user: state.lineProfile?.displayName || null
+      })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || '恢復訂單失敗');
+    }
+    state.orderDetailFetched = await fetchOrderDetail(state.orderDetailOrderId);
+    if (state.orderDetailFetched) {
+      state.orderDetailOrder = { ...state.orderDetailOrder, orderId: state.orderDetailOrderId, items: state.orderDetailFetched.items };
+    }
+    render();
+  } catch (e) {
+    showError(e.message || '恢復訂單失敗');
+  } finally {
+  setLoading(false);
+    render();
   }
 }
 
@@ -2958,6 +3589,50 @@ function renderMenuManagePage(container) {
         ` : ''}
         
         <div class="menu-section" style="margin-top: var(--spacing-lg);">
+          <details class="excel-format-guide" style="background: var(--color-bg-light); border-radius: 8px; border: 1px solid var(--color-border); overflow: hidden;">
+            <summary style="padding: var(--spacing-md); cursor: pointer; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 0.5rem;">
+              <span style="font-size: 1rem;">📋</span> Excel 菜單格式說明（點擊展開）
+            </summary>
+            <div style="padding: 0 var(--spacing-md) var(--spacing-md); font-size: 0.875rem; color: var(--color-text);">
+              <p style="margin-bottom: var(--spacing-md);">上傳菜單 Excel 時，只要照下面格式填，系統就會自動辨識。</p>
+              <div style="margin-bottom: var(--spacing-md);">
+                <div style="font-weight: 600; margin-bottom: 0.35rem;">一、最少要有的三欄</div>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 0.5rem; font-size: 0.8rem;">
+                  <thead><tr style="background: var(--color-primary-light);"><th style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border); text-align: left;">廠商/店家</th><th style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border); text-align: left;">品項</th><th style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border); text-align: left;">數量</th></tr></thead>
+                  <tbody>
+                    <tr><td style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border);">飲料店</td><td style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border);">珍珠奶茶</td><td style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border);">10</td></tr>
+                    <tr><td style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border);">飲料店</td><td style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border);">大杯紅茶</td><td style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border);">5</td></tr>
+                    <tr><td style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border);">便當廠</td><td style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border);">雞腿便當</td><td style="padding: 0.35rem 0.5rem; border: 1px solid var(--color-border);">20</td></tr>
+                  </tbody>
+                </table>
+                <p style="margin: 0; color: var(--color-text-light);">第一列一定要是標題，第二列開始才是資料。</p>
+              </div>
+              <div style="margin-bottom: var(--spacing-md);">
+                <div style="font-weight: 600; margin-bottom: 0.35rem;">二、下拉選單（選填）</div>
+                <p style="margin-bottom: 0.35rem;">多加一欄「下拉選項」，格式：<code style="background: rgba(0,0,0,0.06); padding: 0.1rem 0.25rem; border-radius: 4px;">屬性名稱,選項1,選項2</code>；多個屬性用<strong>分號 ;</strong>隔開。</p>
+                <p style="margin: 0; color: var(--color-text-light);">例：<code style="background: rgba(0,0,0,0.06); padding: 0.1rem 0.25rem; border-radius: 4px;">甜度,正常甜,半糖,微糖,無糖;冰塊,去冰,微冰,少冰,正常冰</code></p>
+              </div>
+              <div style="margin-bottom: var(--spacing-md);">
+                <div style="font-weight: 600; margin-bottom: 0.35rem;">三、完整範例</div>
+                <pre style="margin: 0; padding: var(--spacing-sm); background: rgba(0,0,0,0.05); border-radius: 4px; overflow-x: auto; font-size: 0.75rem; white-space: pre;">廠商    品項      數量  下拉選項
+飲料店  珍珠奶茶  10    甜度,正常甜,半糖,微糖,無糖;冰塊,去冰,微冰,少冰,正常冰
+飲料店  大杯紅茶  5     冰塊,去冰,微冰,正常冰
+便當廠  雞腿便當  20    </pre>
+              </div>
+              <div style="margin-bottom: var(--spacing-md);">
+                <div style="font-weight: 600; margin-bottom: 0.35rem;">常見問題</div>
+                <ul style="margin: 0; padding-left: 1.25rem; color: var(--color-text-light);">
+                  <li>標題可寫英文（Vendor、Item、Qty、Dropdown 都會認）</li>
+                  <li>「下拉選項」不必每列都填，需要時再加即可</li>
+                  <li>逗號、分號請用<strong>半形</strong> , ;</li>
+                </ul>
+              </div>
+              <p style="margin: 0; font-weight: 600;">總結：第一列標題「廠商 / 品項 / 數量」，第二列起填資料；要下拉選單就多加一欄「下拉選項」。</p>
+            </div>
+          </details>
+        </div>
+        
+        <div class="menu-section" style="margin-top: var(--spacing-md);">
           <div class="label-block" style="margin-bottom: var(--spacing-md);">上傳 Excel 菜單</div>
           <input type="file" id="excel-file-input" accept=".xlsx,.xls,.xlsm" style="display: none;" onchange="orderWeb.handleExcelFileSelect(event)">
           <button type="button" class="btn-block" onclick="document.getElementById('excel-file-input').click()" ${state.isLoading ? 'disabled' : ''}>
@@ -2985,8 +3660,12 @@ function renderMenuManagePage(container) {
             ` : ''}
             <div style="background: var(--color-bg-light); padding: var(--spacing-md); border-radius: 8px; margin-bottom: var(--spacing-md);">
               <div style="margin-bottom: var(--spacing-sm);">
+                <label style="display: block; margin-bottom: 0.25rem; font-size: 0.875rem;">廠商欄位（選填）</label>
+                <input type="text" id="mapping-branch" placeholder="例如：D（廠商/店名）" value="${escapeHtml(state.excelMapping?.branchColumn || '')}" style="width: 100%; padding: 0.5rem; border: 1px solid var(--color-border); border-radius: 4px;">
+              </div>
+              <div style="margin-bottom: var(--spacing-sm);">
                 <label style="display: block; margin-bottom: 0.25rem; font-size: 0.875rem;">品項欄位 *</label>
-                <input type="text" id="mapping-item" placeholder="例如：B" value="${escapeHtml(state.excelMapping?.itemColumn || '')}" required style="width: 100%; padding: 0.5rem; border: 1px solid var(--color-border); border-radius: 4px;">
+                <input type="text" id="mapping-item" placeholder="例如：A" value="${escapeHtml(state.excelMapping?.itemColumn || '')}" required style="width: 100%; padding: 0.5rem; border: 1px solid var(--color-border); border-radius: 4px;">
               </div>
               <div style="margin-bottom: var(--spacing-sm);">
                 <label style="display: block; margin-bottom: 0.25rem; font-size: 0.875rem;">數量欄位 *</label>
@@ -2994,7 +3673,13 @@ function renderMenuManagePage(container) {
               </div>
               <div style="margin-bottom: var(--spacing-sm);">
                 <label style="display: block; margin-bottom: 0.25rem; font-size: 0.875rem;">屬性欄位（選填）</label>
-                <input type="text" id="mapping-attr" placeholder="例如：D（選填，單元格可填 冰塊,糖度）" value="${escapeHtml(state.excelMapping?.attrColumn || '')}" style="width: 100%; padding: 0.5rem; border: 1px solid var(--color-border); border-radius: 4px;">
+                <input type="text" id="mapping-attr" placeholder="例如：D（每列該格的屬性值，如 微冰,微糖）" value="${escapeHtml(state.excelMapping?.attrColumn || '')}" style="width: 100%; padding: 0.5rem; border: 1px solid var(--color-border); border-radius: 4px;">
+                <span style="font-size: 0.75rem; color: var(--color-text-light);">→ 填此欄會變成「tag＋加號」選屬性，不會出現下拉選單</span>
+              </div>
+              <div style="margin-bottom: var(--spacing-sm);">
+                <label style="display: block; margin-bottom: 0.25rem; font-size: 0.875rem;">下拉選項欄位（選填）</label>
+                <input type="text" id="mapping-dropdown-options" placeholder="例如：B（格式：甜度,正常甜,半糖,微糖；多個屬性用分號分隔）" value="${escapeHtml(state.excelMapping?.dropdownOptionsColumn || '')}" style="width: 100%; padding: 0.5rem; border: 1px solid var(--color-border); border-radius: 4px;">
+                <span style="font-size: 0.75rem; color: var(--color-text-light);">→ 填此欄才會出現「下拉選單」；若表頭是「屬性格式」請填這裡</span>
               </div>
               <div style="margin-bottom: var(--spacing-sm);">
                 <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem;">
@@ -3461,10 +4146,14 @@ async function submitExcelMapping() {
   console.log('state.excelUploadFile:', state.excelUploadFile);
   console.log('state.excelMapping:', state.excelMapping);
   
+  const branchColumnRaw = document.getElementById('mapping-branch')?.value.trim() || '';
+  const branchColumn = branchColumnRaw ? branchColumnRaw.toUpperCase().split(/[,，\s]+/)[0] : null;
   const itemColumn = document.getElementById('mapping-item')?.value.trim().toUpperCase();
   const qtyColumn = document.getElementById('mapping-qty')?.value.trim().toUpperCase();
   const attrColumnRaw = document.getElementById('mapping-attr')?.value.trim() || '';
   const attrColumn = attrColumnRaw ? attrColumnRaw.toUpperCase().split(/[,，\s]+/)[0] : null;
+  const dropdownOptionsColumnRaw = document.getElementById('mapping-dropdown-options')?.value.trim() || '';
+  const dropdownOptionsColumn = dropdownOptionsColumnRaw ? dropdownOptionsColumnRaw.toUpperCase().split(/[,，\s]+/)[0] : null;
   const hasHeader = document.getElementById('mapping-has-header')?.checked || false;
   
   if (!itemColumn || !qtyColumn) {
@@ -3474,9 +4163,11 @@ async function submitExcelMapping() {
   }
   
   const mapping = {
+    branchColumn: branchColumn || null,
     itemColumn,
     qtyColumn,
     attrColumn: attrColumn || null,
+    dropdownOptionsColumn: dropdownOptionsColumn || null,
     hasHeader,
     startRow: hasHeader ? 2 : 1
   };
@@ -3801,12 +4492,17 @@ function renderSetupOrderFormat(container) {
               </div>
               ${attributes.length > 0 ? `
                 <div class="format-attributes-list">
-                  ${attributes.map((attr, attrIdx) => `
+                  ${attributes.map((attr, attrIdx) => {
+                    const label = attr.name || '屬性名稱';
+                    const opts = (attr.options && Array.isArray(attr.options) && attr.options.length) ? attr.options.join('、') : '';
+                    const display = opts ? `${label} (${opts})` : label;
+                    return `
                     <div class="format-attribute-item">
-                      <button type="button" class="btn-format-attr" onclick="orderWeb.editAttribute(${idx}, ${attrIdx})">${escapeHtml(attr.name || '屬性名稱')}</button>
+                      <button type="button" class="btn-format-attr" onclick="orderWeb.editAttribute(${idx}, ${attrIdx})" title="${opts ? '格式：名稱,選項1,選項2,...' : ''}">${escapeHtml(display)}</button>
                       <button type="button" class="btn-format-attr-remove" onclick="orderWeb.removeAttribute(${idx}, ${attrIdx})" title="移除屬性">×</button>
                     </div>
-                  `).join('')}
+                  `;
+                  }).join('')}
                 </div>
               ` : ''}
             </div>
@@ -4100,13 +4796,22 @@ function editItemName(idx) {
   }
 }
 
+/** 解析屬性輸入：「名稱,選項1,選項2,...」→ { name, options[] }；僅名稱 → { name } */
+function parseAttributeInput(input) {
+  const s = (input || '').trim();
+  if (!s) return null;
+  const parts = s.split(',').map(p => p.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return { name: parts[0] };
+  return { name: parts[0], options: parts.slice(1) };
+}
+
 function editAttribute(itemIdx, attrIdx) {
   if (!state.orderFormatItems[itemIdx]) return;
   if (!state.orderFormatItems[itemIdx].attributes) {
     state.orderFormatItems[itemIdx].attributes = [];
   }
   if (attrIdx === undefined || attrIdx === null) {
-    // 如果沒有指定 attrIdx，表示要編輯第一個屬性，如果沒有則新增
     if (state.orderFormatItems[itemIdx].attributes.length === 0) {
       addAttribute(itemIdx);
       return;
@@ -4114,12 +4819,19 @@ function editAttribute(itemIdx, attrIdx) {
     attrIdx = 0;
   }
   const currentAttr = state.orderFormatItems[itemIdx].attributes[attrIdx];
-  const attrName = prompt('請輸入屬性名稱（例如：冰塊、甜度、顏色）：', currentAttr?.name || '');
-  if (attrName !== null && attrName.trim()) {
+  const currentDisplay = currentAttr
+    ? (currentAttr.options && currentAttr.options.length
+      ? [currentAttr.name, ...(currentAttr.options || [])].join(', ')
+      : (currentAttr.name || ''))
+    : '';
+  const attrInput = prompt('格式：屬性名稱,選項1,選項2,...\n例如：甜度,正常甜,半糖,微糖,無糖\n（僅名稱則無下拉選項）', currentDisplay);
+  const parsed = parseAttributeInput(attrInput);
+  if (parsed) {
     if (!state.orderFormatItems[itemIdx].attributes[attrIdx]) {
       state.orderFormatItems[itemIdx].attributes[attrIdx] = { name: '' };
     }
-    state.orderFormatItems[itemIdx].attributes[attrIdx].name = attrName.trim();
+    state.orderFormatItems[itemIdx].attributes[attrIdx].name = parsed.name;
+    state.orderFormatItems[itemIdx].attributes[attrIdx].options = parsed.options || undefined;
     render();
   }
 }
@@ -4131,9 +4843,10 @@ function addAttribute(itemIdx) {
   if (!state.orderFormatItems[itemIdx].attributes) {
     state.orderFormatItems[itemIdx].attributes = [];
   }
-  const attrName = prompt('請輸入屬性名稱（例如：冰塊、甜度、顏色）：', '');
-  if (attrName !== null && attrName.trim()) {
-    state.orderFormatItems[itemIdx].attributes.push({ name: attrName.trim() });
+  const attrInput = prompt('格式：屬性名稱,選項1,選項2,...\n例如：甜度,正常甜,半糖,微糖,無糖\n（僅名稱則無下拉選項）', '');
+  const parsed = parseAttributeInput(attrInput);
+  if (parsed) {
+    state.orderFormatItems[itemIdx].attributes.push({ name: parsed.name, ...(parsed.options && parsed.options.length ? { options: parsed.options } : {}) });
     render();
   }
 }
@@ -4185,11 +4898,15 @@ async function completeOrderFormat() {
   state.errorMessage = null;
   
   try {
-    // 將 orderFormatItems 轉換為 orderFormat JSON
+    // 將 orderFormatItems 轉換為 orderFormat JSON（支援 attr.options）
     const orderFormat = {
       items: state.orderFormatItems.map(item => ({
         name: item.name,
-        attributes: (item.attributes || []).map(attr => attr.name || attr)
+        attributes: (item.attributes || []).map(attr => {
+          const name = (typeof attr === 'object' && attr && attr.name) ? attr.name : String(attr || '');
+          const options = (typeof attr === 'object' && attr && Array.isArray(attr.options)) ? attr.options : undefined;
+          return options && options.length ? { name, options } : { name };
+        })
       }))
     };
     
@@ -4294,6 +5011,7 @@ window.orderWeb = {
   removeItemAttributeById,
   toggleItemAttribute,
   setItemAttributeValue,
+  setItemAttributeFromSelect,
   duplicateItemWithAttributes,
   goBack,
   goToConfirm,
@@ -4349,6 +5067,16 @@ window.orderWeb = {
   handleMenuImageUpload,
   deleteMenuImage,
   removeMember,
+  openOrderDetail,
+  openOrderDetailByOrderId,
+  closeOrderDetail,
+  setOrderDetailSelectedMenuItem,
+  setOrderDetailNewItemAttr,
+  updateOrderItemQty,
+  deleteOrderItem,
+  addOrderItemFromInput,
+  cancelOrderConfirm,
+  restoreOrder,
   render
 };
 
