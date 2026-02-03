@@ -397,6 +397,45 @@ async function notifyOwnerNewOrder(db, worldId, orderId, branch, items, ordererN
 }
 
 /**
+ * 通知消費者（下單者）訂單已送出
+ */
+async function notifyConsumerNewOrder(db, worldId, orderId, items, consumerUserId, ordererName) {
+  if (!worldId || !consumerUserId) return;
+  try {
+    const worldVendorMap = await getVendorMap(db, worldId);
+    const vendorItemsMap = {};
+    for (const item of items) {
+      let vendor = null;
+      if (worldVendorMap && typeof worldVendorMap === 'object') {
+        vendor = resolveVendorForItemName(item.name, worldVendorMap);
+      }
+      if (!vendor) vendor = getVendorByItem(item.name) || '其他';
+      if (!vendorItemsMap[vendor]) vendorItemsMap[vendor] = [];
+      vendorItemsMap[vendor].push(item);
+    }
+    let msg = `📦 您的訂單已送出\n訂單 ID: ${orderId}\n\n`;
+    const vendors = Object.keys(vendorItemsMap).sort();
+    vendors.forEach((vendor) => {
+      msg += `${vendor}：\n`;
+      vendorItemsMap[vendor].forEach((item) => {
+        msg += `• ${item.name} x${item.qty}\n`;
+      });
+      msg += `\n`;
+    });
+    msg = msg.trimEnd();
+    const { pushLineMessage } = await import('./line.handler.js');
+    const success = await pushLineMessage(consumerUserId, msg);
+    if (success) {
+      console.log(`✅ 已通知消費者 (${consumerUserId}) 訂單已送出 (${orderId})`);
+    } else {
+      console.warn(`⚠️ 通知消費者 (${consumerUserId}) 失敗，可能未加 Bot 為好友`);
+    }
+  } catch (err) {
+    console.error('❌ 通知消費者時發生錯誤:', err);
+  }
+}
+
+/**
  * 查看世界成員名單
  */
 export async function flowViewMembers(db, userId, replyToken, state, { reply }) {
@@ -957,7 +996,7 @@ export async function flowOrder(db, userId, parsed, replyToken, state, { reply }
       // }
       
       const displayName = await getLineDisplayName(userId);
-      const orderId = await createOrder(db, parsed.branch, parsed.items, displayName || 'LINE', worldId);
+      const orderId = await createOrder(db, parsed.branch, parsed.items, displayName || 'LINE', worldId, userId);
       console.log(`✅ 已存入 ${parsed.branch} 訂單，共 ${parsed.items.length} 項商品，訂單 ID: ${orderId}`);
       let replyMsg = `✅ 訂單已建立\n訂單 ID: ${orderId}\n分店: ${parsed.branch}\n`;
       parsed.items.forEach((item) => { replyMsg += `${item.name} x${item.qty}\n`; });
@@ -965,6 +1004,8 @@ export async function flowOrder(db, userId, parsed, replyToken, state, { reply }
       
       // 通知 owner 有新訂單
       await notifyOwnerNewOrder(db, worldId, orderId, parsed.branch, parsed.items, displayName || 'LINE');
+      // 通知消費者（下單者）訂單資訊
+      await notifyConsumerNewOrder(db, worldId, orderId, parsed.items, userId, displayName || 'LINE');
     } else if (parsed.type === 'MODIFY' || parsed.type === 'MODIFY_SET') {
       const result = await modifyOrderItemByName(
         db,

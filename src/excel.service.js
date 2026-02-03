@@ -293,10 +293,20 @@ export function parseExcelToItemAttributeOptions(workbook, mapping, sheetName = 
 export function parseExcelToVendorMap(workbook, mapping, sheetName = null) {
   try {
     const sheet = sheetName ? workbook.Sheets[sheetName] : workbook.Sheets[workbook.SheetNames[0]];
-    if (!sheet) return null;
+    if (!sheet) {
+      const err = new Error('格式錯誤：找不到工作表');
+      err.details = sheetName ? `工作表「${sheetName}」不存在` : 'Excel 檔案中沒有工作表';
+      err.code = 'EXCEL_NO_SHEET';
+      throw err;
+    }
 
     const range = XLSX.utils.decode_range(sheet['!ref'] || 'A1');
-    if (range.e.c < 0 || range.e.r < 0) return null;
+    if (range.e.c < 0 || range.e.r < 0) {
+      const err = new Error('格式錯誤：工作表為空或無有效範圍');
+      err.details = '請確認 Excel 中有資料';
+      err.code = 'EXCEL_EMPTY_RANGE';
+      throw err;
+    }
 
     const vendorMap = {};
     const startRow = mapping.startRow || (mapping.hasHeader ? 2 : 1);
@@ -358,15 +368,21 @@ export function parseExcelToVendorMap(workbook, mapping, sheetName = null) {
       }
     }
 
-    // 驗證結果
     if (Object.keys(vendorMap).length === 0) {
-      console.error('❌ 解析結果為空：未讀取到任何有效資料');
-      console.error('   欄位設定:', { branchColumn: mapping.branchColumn, itemColumn: mapping.itemColumn, qtyColumn: mapping.qtyColumn, hasHeader: mapping.hasHeader, startRow });
-      console.error('   Excel 範圍:', { startRow: startRow - 1, endRow: range.e.r, itemColIndex, qtyColIndex });
-      return null;
+      const itemCol = mapping.itemColumn ? `欄位 ${mapping.itemColumn}` : '品項欄位';
+      const qtyCol = mapping.qtyColumn ? `欄位 ${mapping.qtyColumn}` : '數量欄位';
+      const details = [
+        `• 資料起始行：第 ${startRow} 行`,
+        `• 品項欄位：${itemCol}`,
+        `• 數量欄位：${qtyCol}`,
+        '• 可能原因：品項或數量欄位設定錯誤、起始行錯誤、數量為 0 或負數、品項名稱為空'
+      ].join('\n');
+      const err = new Error('格式錯誤：未讀取到任何有效資料');
+      err.details = details;
+      err.code = 'EXCEL_PARSE_EMPTY';
+      throw err;
     }
 
-    // 確保每個分店至少有一個品項
     for (const branch of Object.keys(vendorMap)) {
       if (Object.keys(vendorMap[branch]).length === 0) {
         delete vendorMap[branch];
@@ -374,14 +390,20 @@ export function parseExcelToVendorMap(workbook, mapping, sheetName = null) {
     }
 
     if (Object.keys(vendorMap).length === 0) {
-      console.error('❌ 解析結果為空：所有分店的品項都被過濾掉了');
-      return null;
+      const err = new Error('格式錯誤：所有品項因數量無效被過濾');
+      err.details = '請確認數量欄位中沒有 0 或負數';
+      err.code = 'EXCEL_PARSE_FILTERED';
+      throw err;
     }
 
     return vendorMap;
   } catch (err) {
+    if (err.code === 'EXCEL_PARSE_EMPTY' || err.code === 'EXCEL_PARSE_FILTERED') throw err;
     console.error('❌ 解析 Excel 失敗:', err);
-    return null;
+    const wrap = new Error('格式錯誤：讀取 Excel 時發生錯誤');
+    wrap.details = err.message || '請檢查檔案是否為有效 Excel 格式';
+    wrap.code = 'EXCEL_PARSE_ERROR';
+    throw wrap;
   }
 }
 

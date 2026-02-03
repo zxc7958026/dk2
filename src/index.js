@@ -36,6 +36,8 @@ import { formatOrdersByDisplayFormat, formatOrdersByVendorDefault, validateItemB
 dotenv.config({ path: join(__dirname, '.env') });
 
 const app = express();
+// Zeabur / 雲端 proxy 會轉發 X-Forwarded-Proto，需 trust proxy 讓 req.protocol 正確
+app.set('trust proxy', 1);
 // 資料庫路徑：有 DATA_DIR（雲端 Volume）則用該目錄，否則用 src 目錄
 const dataDir = process.env.DATA_DIR || __dirname;
 const dbPath = join(dataDir, 'orders.db');
@@ -212,6 +214,12 @@ async function getAndValidateCurrentWorld(db, userId) {
   return { worldId, binding: currentBinding };
 }
 
+/** 取得使用者為 owner 的世界 ID 列表 */
+async function getOwnerWorldIds(db, userId) {
+  const bindings = await getBindings(db, userId);
+  return bindings.filter((b) => b.role === 'owner' && b.status === 'active').map((b) => b.worldId);
+}
+
 /** 檢查 vendorMap 的 key 是否像 hash/userId（表示廠商欄位可能對應錯誤） */
 function vendorKeysLookLikeHash(vendorMap) {
   if (!vendorMap || typeof vendorMap !== 'object') return false;
@@ -347,6 +355,12 @@ app.post('/api/orders', async (req, res) => {
       notifyOwnerNewOrderAPI(db, worldId, orderId, null, formattedItems, user || 'API使用者').catch(err => {
         console.error('❌ API 通知 owner 時發生錯誤:', err);
       });
+      // 通知消費者（下單者）訂單資訊
+      if (userId) {
+        notifyConsumerNewOrderAPI(db, worldId, orderId, formattedItems, userId, user || 'API使用者').catch(err => {
+          console.error('❌ API 通知消費者時發生錯誤:', err);
+        });
+      }
     }
     
     res.json({ 
@@ -388,7 +402,12 @@ app.put('/api/orders/items/:itemId', async (req, res) => {
     if (!oldItem) {
       return res.status(404).json({ error: '找不到該訂單品項' });
     }
+    const orderer = await getOrdererFromHistory(db, oldItem.order_id);
+    if (orderer && orderer.userId && orderer.userId !== userId) {
+      return res.status(403).json({ error: '僅訂單建立者可以修改此訂單' });
+    }
 
+    const beforeItems = await getOrderItems(db, oldItem.order_id);
     // 更新數量
     await new Promise((resolve, reject) => {
       db.run(
@@ -402,6 +421,7 @@ app.put('/api/orders/items/:itemId', async (req, res) => {
     });
 
     const newItem = { ...oldItem, qty };
+    const afterItems = beforeItems.map(it => (it.id === itemId ? { ...it, qty } : it));
     
     // 記錄歷史（含 userId 和 worldId，供「我的訂單」和「我收到的訂單」使用）
     await logOrderHistory(
@@ -460,13 +480,16 @@ app.post('/api/orders/:orderId/items', async (req, res) => {
       return res.status(404).json({ error: '找不到該訂單' });
     }
 
-    // 檢查訂單是否屬於使用者的當前世界
     const orderWorldId = orderItems[0].worldId;
     if (orderWorldId !== null) {
-      const currentWorld = await getAndValidateCurrentWorld(db, userId);
-      if (!currentWorld || currentWorld.worldId !== orderWorldId) {
-        return res.status(403).json({ error: '您沒有權限修改此訂單（不屬於您的當前世界）' });
+      const userWorldIds = bindings.filter((b) => b.status === 'active').map((b) => b.worldId);
+      if (!userWorldIds.includes(orderWorldId)) {
+        return res.status(403).json({ error: '您沒有權限修改此訂單（不屬於您的世界）' });
       }
+    }
+    const orderer = await getOrdererFromHistory(db, orderId);
+    if (orderer && orderer.userId && orderer.userId !== userId) {
+      return res.status(403).json({ error: '僅訂單建立者可以修改此訂單' });
     }
 
     const branch = orderItems[0].branch;
@@ -530,15 +553,18 @@ app.delete('/api/orders/items/:itemId', async (req, res) => {
     if (!oldItem) {
       return res.status(404).json({ error: '找不到該訂單品項' });
     }
-
-    // 檢查訂單是否屬於使用者的當前世界
+    const orderer = await getOrdererFromHistory(db, oldItem.order_id);
+    if (orderer && orderer.userId && orderer.userId !== userId) {
+      return res.status(403).json({ error: '僅訂單建立者可以修改此訂單' });
+    }
     if (oldItem.worldId !== null) {
-      const currentWorld = await getAndValidateCurrentWorld(db, userId);
-      if (!currentWorld || currentWorld.worldId !== oldItem.worldId) {
-        return res.status(403).json({ error: '您沒有權限刪除此訂單品項（不屬於您的當前世界）' });
+      const userWorldIds = bindings.filter((b) => b.status === 'active').map((b) => b.worldId);
+      if (!userWorldIds.includes(oldItem.worldId)) {
+        return res.status(403).json({ error: '您沒有權限刪除此訂單品項（不屬於您的世界）' });
       }
     }
 
+    const beforeItems = await getOrderItems(db, oldItem.order_id);
     // 刪除品項
     await new Promise((resolve, reject) => {
       db.run('DELETE FROM orders WHERE id = ?', [itemId], function(err) {
@@ -546,6 +572,7 @@ app.delete('/api/orders/items/:itemId', async (req, res) => {
         else resolve(this.changes);
       });
     });
+    const afterItems = beforeItems.filter(it => it.id !== itemId);
 
     // 記錄歷史（含 userId 和 worldId，供「我的訂單」和「我收到的訂單」使用）
     await logOrderHistory(
@@ -566,6 +593,114 @@ app.delete('/api/orders/items/:itemId', async (req, res) => {
   } catch (err) {
     console.error('❌ 刪除品項失敗:', err);
     res.status(500).json({ error: '刪除品項時發生錯誤，請稍後再試' });
+  }
+});
+
+/**
+ * 批次編輯訂單（確定編輯時一次送出，完成後發送通知）
+ * POST /api/orders/:orderId/batch-edit
+ * Body: { userId, user?, qtyUpdates: [{itemId, qty}], adds: [{name, qty}], deletes: [itemId] }
+ */
+app.post('/api/orders/:orderId/batch-edit', async (req, res) => {
+  try {
+    const orderId = parseInt(req.params.orderId);
+    const { userId, user, qtyUpdates = [], adds = [], deletes = [] } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: '缺少必要參數：userId' });
+    }
+    const bindings = await getBindings(db, userId);
+    const isActive = bindings.some((b) => b.status === 'active');
+    if (!isActive) {
+      const msg = bindings.length === 0 ? '您尚未加入任何世界' : '此世界尚未完成設定\n・員工請等待老闆完成設定\n・老闆可繼續進行設定';
+      return res.status(403).json({ error: msg });
+    }
+
+    const beforeItems = await getOrderItems(db, orderId);
+    if (beforeItems.length === 0) {
+      return res.status(404).json({ error: '找不到該訂單' });
+    }
+
+    const orderWorldId = beforeItems[0].worldId;
+    if (orderWorldId !== null) {
+      const userWorldIds = bindings.filter((b) => b.status === 'active').map((b) => b.worldId);
+      if (!userWorldIds.includes(orderWorldId)) {
+        return res.status(403).json({ error: '您沒有權限修改此訂單' });
+      }
+    }
+    const orderer = await getOrdererFromHistory(db, orderId);
+    if (orderer && orderer.userId && orderer.userId !== userId) {
+      return res.status(403).json({ error: '僅訂單建立者可以修改此訂單' });
+    }
+
+    const branch = beforeItems[0].branch;
+    const deleteSet = new Set(Array.isArray(deletes) ? deletes.map(id => parseInt(id, 10)).filter(n => !isNaN(n)) : []);
+
+    for (const itemId of deleteSet) {
+      await new Promise((resolve, reject) => {
+        db.run('DELETE FROM orders WHERE id = ? AND order_id = ?', [itemId, orderId], function(err) {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    }
+
+    for (const u of Array.isArray(qtyUpdates) ? qtyUpdates : []) {
+      const itemId = parseInt(u.itemId, 10);
+      const qty = parseInt(u.qty, 10);
+      if (isNaN(itemId) || isNaN(qty) || qty <= 0 || qty > 999999) continue;
+      await new Promise((resolve, reject) => {
+        db.run('UPDATE orders SET qty = ? WHERE id = ? AND order_id = ?', [qty, itemId, orderId], function(err) {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    }
+
+    for (const a of Array.isArray(adds) ? adds : []) {
+      const name = (a.name || '').toString().trim();
+      const qty = parseInt(a.qty, 10);
+      if (!name || isNaN(qty) || qty <= 0 || qty > 999999) continue;
+      await new Promise((resolve, reject) => {
+        db.run(
+          'INSERT INTO orders (order_id, branch, item, qty, worldId) VALUES (?, ?, ?, ?, ?)',
+          [orderId, branch, name, qty, orderWorldId],
+          function(err) {
+            if (err) reject(err);
+            else resolve();
+          }
+        );
+      });
+    }
+
+    const afterItems = await getOrderItems(db, orderId);
+    const hasChanges = deleteSet.size > 0 || (Array.isArray(qtyUpdates) && qtyUpdates.length > 0) || (Array.isArray(adds) && adds.length > 0);
+    if (hasChanges) {
+      await logOrderHistory(
+        db,
+        orderId,
+        '編輯訂單',
+        { items: beforeItems.map(i => ({ id: i.id, item: i.item, qty: i.qty })) },
+        { items: afterItems.map(i => ({ id: i.id, item: i.item, qty: i.qty })) },
+        user || null,
+        userId || null,
+        orderWorldId || null
+      );
+    }
+    if (hasChanges && orderWorldId) {
+      notifyOrderEdited(db, orderWorldId, orderId, userId, user || null, beforeItems, afterItems).catch(err => {
+        console.error('❌ 通知訂單編輯時發生錯誤:', err);
+      });
+    }
+
+    res.json({
+      success: true,
+      message: '訂單編輯完成',
+      items: afterItems.map(it => ({ id: it.id, item: it.item, qty: it.qty }))
+    });
+  } catch (err) {
+    console.error('❌ 批次編輯訂單失敗:', err);
+    res.status(500).json({ error: '編輯訂單時發生錯誤，請稍後再試' });
   }
 });
 
@@ -593,14 +728,14 @@ app.post('/api/orders/:orderId/cancel', async (req, res) => {
     if (orderItems.length === 0) {
       return res.status(404).json({ error: '找不到該訂單' });
     }
-
-    // 檢查訂單是否屬於使用者的世界
     const orderWorldId = orderItems[0].worldId;
-    if (orderWorldId !== null) {
-      const userWorldIds = bindings.filter((b) => b.status === 'active').map((b) => b.worldId);
-      if (!userWorldIds.includes(orderWorldId)) {
-        return res.status(403).json({ error: '您沒有權限取消此訂單（不屬於您的世界）' });
-      }
+    const userWorldIds = bindings.filter((b) => b.status === 'active').map((b) => b.worldId);
+    if (orderWorldId !== null && !userWorldIds.includes(orderWorldId)) {
+      return res.status(403).json({ error: '您沒有權限取消此訂單（不屬於您的世界）' });
+    }
+    const orderer = await getOrdererFromHistory(db, orderId);
+    if (orderer && orderer.userId && orderer.userId !== userId) {
+      return res.status(403).json({ error: '僅訂單建立者可以取消此訂單' });
     }
 
     // 從 orders 表中刪除所有品項（orders 只存現在訂單狀況）
@@ -683,6 +818,10 @@ app.post('/api/orders/:orderId/restore', async (req, res) => {
 
     if (history.length === 0) {
       return res.status(404).json({ error: '找不到可恢復的訂單記錄' });
+    }
+    const orderer = await getOrdererFromHistory(db, orderId);
+    if (orderer && orderer.userId && orderer.userId !== userId) {
+      return res.status(403).json({ error: '僅訂單建立者可以恢復此訂單' });
     }
 
     const cancelRecord = history[0];
@@ -831,13 +970,22 @@ app.get('/api/orders/:orderId', async (req, res, next) => {
       return res.status(404).json({ error: '找不到該訂單' });
     }
 
-    // 檢查訂單是否屬於使用者的世界
     const orderWorldId = items[0].worldId;
-    if (orderWorldId !== null) {
-      const userWorldIds = bindings.filter((b) => b.status === 'active').map((b) => b.worldId);
-      if (!userWorldIds.includes(orderWorldId)) {
-        return res.status(403).json({ error: '您沒有權限查詢此訂單（不屬於您的世界）' });
-      }
+    const userWorldIds = bindings.filter((b) => b.status === 'active').map((b) => b.worldId);
+    if (orderWorldId !== null && !userWorldIds.includes(orderWorldId)) {
+      return res.status(403).json({ error: '您沒有權限查詢此訂單（不屬於您的世界）' });
+    }
+
+    // 僅訂單建立者或世界擁有者可檢視；其他消費者看不到他人訂單
+    const orderer = await getOrdererFromHistory(db, orderId);
+    const ordererUserId = orderer ? orderer.userId : null;
+    let isOwner = false;
+    if (orderWorldId != null) {
+      const world = await getWorldById(db, orderWorldId);
+      isOwner = world && world.ownerUserId === userId;
+    }
+    if (ordererUserId !== userId && !isOwner) {
+      return res.status(403).json({ error: '您沒有權限查詢此訂單（僅訂單建立者可檢視）' });
     }
 
     res.json({
@@ -1522,28 +1670,33 @@ app.post('/api/worlds/leave', async (req, res) => {
 });
 
 /**
- * 查詢我收到的訂單（當前世界的所有訂單，僅 owner）
- * GET /api/orders/received?userId=xxx&date=今天
+ * 查詢我收到的訂單（可選擇世界與日期，僅 owner）
+ * GET /api/orders/received?userId=xxx&date=今天&worldId=xxx
  */
 app.get('/api/orders/received', async (req, res) => {
   try {
-    const { userId, date } = req.query;
+    const { userId, date, worldId } = req.query;
     
     if (!userId) {
       return res.status(400).json({ error: '缺少必要參數：userId' });
     }
 
-    // 只允許「當前世界」的 owner 查詢
-    const current = await getAndValidateCurrentWorld(db, userId);
-    if (!current) {
-      return res.status(403).json({ error: '此世界尚未完成設定\n・員工請等待老闆完成設定\n・老闆可繼續進行設定' });
-    }
-    if (current.binding.role !== 'owner') {
+    const ownerWorldIds = await getOwnerWorldIds(db, userId);
+    if (ownerWorldIds.length === 0) {
       return res.status(403).json({ error: '僅世界擁有者可以查看收到的訂單' });
     }
+
+    let filterWorldId = null;
+    if (worldId && worldId !== 'all') {
+      const wid = parseInt(worldId, 10);
+      if (!isNaN(wid) && ownerWorldIds.includes(wid)) {
+        filterWorldId = wid;
+      }
+    }
     
-    const dateStr = date || '今天';
-    const today = new Date().toISOString().split('T')[0];
+    const dateStr = (date === '' || date === '全部') ? '全部' : (date || '今天');
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
     
     // 從 order_history 查詢「當前世界」的所有訂單
     const rows = await new Promise((resolve, reject) => {
@@ -1576,7 +1729,6 @@ app.get('/api/orders/received', async (req, res) => {
         continue;
       }
       
-      // 檢查日期
       const rowDate = row.created_at.split(' ')[0];
       let matchDate = false;
       
@@ -1603,33 +1755,36 @@ app.get('/api/orders/received', async (req, res) => {
         continue;
       }
 
-      // 僅保留屬於「當前世界」的訂單
-      // 優先從 order_history.worldId 取得（即使訂單被取消也能查詢）
+      const orderItems = await getOrderItems(db, row.order_id);
       let orderWorldId = row.worldId;
-      // 如果 order_history 中沒有 worldId（舊資料），則從 orders 表查詢
       if (orderWorldId === null || orderWorldId === undefined) {
-        const orderItems = await getOrderItems(db, row.order_id);
         if (orderItems && orderItems.length > 0) {
           orderWorldId = orderItems[0].worldId;
         }
       }
-      // 如果還是沒有 worldId，跳過此訂單
-      if (orderWorldId === null || orderWorldId === undefined || orderWorldId !== current.worldId) {
-        continue;
-      }
+      if (orderWorldId === null || orderWorldId === undefined) continue;
+      if (filterWorldId !== null ? orderWorldId !== filterWorldId : !ownerWorldIds.includes(orderWorldId)) continue;
       if (isSampleOrder(newData, row)) continue;
+      
+      const displayItems = (orderItems && orderItems.length > 0)
+        ? orderItems.map(oi => ({ name: oi.item, item: oi.item, qty: oi.qty }))
+        : newData.items;
+      const branch = (orderItems && orderItems.length > 0) ? orderItems[0].branch : newData.branch;
+      const world = orderWorldId ? await getWorldById(db, orderWorldId) : null;
+      const worldName = world ? (world.name || `世界 #${String(world.id).padStart(6, '0')}`) : null;
       
       results.push({
         orderId: row.order_id,
-        branch: newData.branch,
-        items: newData.items,
+        branch,
+        items: displayItems,
         createdAt: row.created_at,
-        user: row.user, // 顯示下單者名稱
-        userId: row.userId // 下單者 userId
+        user: row.user,
+        userId: row.userId,
+        worldName,
+        worldCode: world?.worldCode || null
       });
     }
     
-    // 以訂購人為主排序，其次依建立時間新→舊
     const sorted = results.sort((a, b) => {
       const ua = (a.user || '').localeCompare ? (a.user || '') : String(a.user || '');
       const ub = (b.user || '').localeCompare ? (b.user || '') : String(b.user || '');
@@ -1651,27 +1806,32 @@ app.get('/api/orders/received', async (req, res) => {
 
 /**
  * 匯出我收到的訂單為 Excel（僅 owner）
- * GET /api/orders/received/export?userId=xxx&date=今天&columns=...
+ * GET /api/orders/received/export?userId=xxx&date=今天&worldId=xxx&columns=...
  */
 app.get('/api/orders/received/export', async (req, res) => {
   try {
-    const { userId, date, columns } = req.query;
+    const { userId, date, worldId, columns } = req.query;
     
     if (!userId) {
       return res.status(400).json({ error: '缺少必要參數：userId' });
     }
 
-    // 只允許「當前世界」的 owner 匯出
-    const current = await getAndValidateCurrentWorld(db, userId);
-    if (!current) {
-      return res.status(403).json({ error: '此世界尚未完成設定\n・員工請等待老闆完成設定\n・老闆可繼續進行設定' });
-    }
-    if (current.binding.role !== 'owner') {
+    const ownerWorldIds = await getOwnerWorldIds(db, userId);
+    if (ownerWorldIds.length === 0) {
       return res.status(403).json({ error: '僅世界擁有者可以匯出訂單' });
     }
+
+    let filterWorldId = null;
+    if (worldId && worldId !== 'all') {
+      const wid = parseInt(worldId, 10);
+      if (!isNaN(wid) && ownerWorldIds.includes(wid)) {
+        filterWorldId = wid;
+      }
+    }
     
-    const dateStr = date || '今天';
-    const today = new Date().toISOString().split('T')[0];
+    const dateStr = (date === '' || date === '全部') ? '全部' : (date || '今天');
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
     
     // 解析欄位設定
     let columnConfig = null;
@@ -1694,9 +1854,6 @@ app.get('/api/orders/received/export', async (req, res) => {
       { key: 'branch', label: '分店', enabled: false },
       { key: 'userId', label: '訂購人ID', enabled: false }
     ];
-    
-    // 取得世界的 vendorMap（用於查找廠商）
-    const vendorMap = await getVendorMap(db, current.worldId);
 
     // 取得啟用的欄位並保持順序
     const activeColumns = (columnConfig || defaultColumns)
@@ -1723,8 +1880,9 @@ app.get('/api/orders/received/export', async (req, res) => {
       );
     });
     
-    // 過濾並格式化結果
+    // 過濾並格式化結果，vendorMap 依世界快取
     const results = [];
+    const vendorMapCache = {};
     
     for (const row of rows) {
       let newData;
@@ -1738,7 +1896,6 @@ app.get('/api/orders/received/export', async (req, res) => {
         continue;
       }
       
-      // 檢查日期
       const rowDate = row.created_at.split(' ')[0];
       let matchDate = false;
       
@@ -1759,35 +1916,34 @@ app.get('/api/orders/received/export', async (req, res) => {
         }
       }
       
-      if (!matchDate) {
-        continue;
-      }
+      if (!matchDate) continue;
 
-      // 僅保留屬於「當前世界」的訂單
-      // 優先從 order_history.worldId 取得（即使訂單被取消也能查詢）
+      const orderItems = await getOrderItems(db, row.order_id);
       let orderWorldId = row.worldId;
-      // 如果 order_history 中沒有 worldId（舊資料），則從 orders 表查詢
-      if (orderWorldId === null || orderWorldId === undefined) {
-        const orderItems = await getOrderItems(db, row.order_id);
-        if (orderItems && orderItems.length > 0) {
-          orderWorldId = orderItems[0].worldId;
-        }
+      if ((orderWorldId === null || orderWorldId === undefined) && orderItems && orderItems.length > 0) {
+        orderWorldId = orderItems[0].worldId;
       }
-      // 如果還是沒有 worldId，跳過此訂單
-      if (orderWorldId === null || orderWorldId === undefined || orderWorldId !== current.worldId) {
-        continue;
-      }
+      if (orderWorldId === null || orderWorldId === undefined) continue;
+      if (filterWorldId !== null ? orderWorldId !== filterWorldId : !ownerWorldIds.includes(orderWorldId)) continue;
       if (isSampleOrder(newData, row)) continue;
       
-      // 將每個品項展開為一行
-      for (const item of newData.items) {
+      if (!vendorMapCache[orderWorldId]) {
+        vendorMapCache[orderWorldId] = await getVendorMap(db, orderWorldId);
+      }
+      const vendorMap = vendorMapCache[orderWorldId];
+      const displayItems = (orderItems && orderItems.length > 0)
+        ? orderItems.map(oi => ({ name: oi.item, item: oi.item, qty: oi.qty }))
+        : newData.items;
+      const branchVal = (orderItems && orderItems.length > 0) ? orderItems[0].branch : newData.branch;
+      
+      for (const item of displayItems) {
         const itemName = item.name || item.item || '';
         const vendor = (vendorMap && itemName) ? (resolveVendorForItemName(itemName, vendorMap) || getVendorByItem(itemName) || '') : '';
         
         // 建立一筆「欄位 key 為主」的資料列
         const rowData = {
           orderId: row.order_id,
-          branch: newData.branch,
+          branch: branchVal,
           vendor: vendor || '',
           itemName,
           qty: item.qty || 0,
@@ -1888,30 +2044,32 @@ app.get('/api/orders/received/export', async (req, res) => {
 
 /**
  * 預覽我收到的訂單欄位（僅 owner，給前端顯示用）
- * GET /api/orders/received/preview?userId=xxx&date=今天
+ * GET /api/orders/received/preview?userId=xxx&date=今天&worldId=xxx
  */
 app.get('/api/orders/received/preview', async (req, res) => {
   try {
-    const { userId, date } = req.query;
+    const { userId, date, worldId } = req.query;
     
     if (!userId) {
       return res.status(400).json({ error: '缺少必要參數：userId' });
     }
 
-    // 只允許「當前世界」的 owner 查看
-    const current = await getAndValidateCurrentWorld(db, userId);
-    if (!current) {
-      return res.status(403).json({ error: '此世界尚未完成設定\n・員工請等待老闆完成設定\n・老闆可繼續進行設定' });
-    }
-    if (current.binding.role !== 'owner') {
+    const ownerWorldIds = await getOwnerWorldIds(db, userId);
+    if (ownerWorldIds.length === 0) {
       return res.status(403).json({ error: '僅世界擁有者可以查看收到的訂單' });
     }
+
+    let filterWorldId = null;
+    if (worldId && worldId !== 'all') {
+      const wid = parseInt(worldId, 10);
+      if (!isNaN(wid) && ownerWorldIds.includes(wid)) {
+        filterWorldId = wid;
+      }
+    }
     
-    const dateStr = date || '今天';
-    const today = new Date().toISOString().split('T')[0];
-    
-    // 取得世界的 vendorMap（用於查找廠商）
-    const vendorMap = await getVendorMap(db, current.worldId);
+    const dateStr = (date === '' || date === '全部') ? '全部' : (date || '今天');
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
     // 預設欄位順序（與 Excel 匯出 / 前端設定一致）
     const defaultColumns = [
@@ -1943,6 +2101,7 @@ app.get('/api/orders/received/preview', async (req, res) => {
     });
     
     const results = [];
+    const vendorMapCache = {};
     
     for (const row of rows) {
       let newData;
@@ -1956,7 +2115,6 @@ app.get('/api/orders/received/preview', async (req, res) => {
         continue;
       }
       
-      // 檢查日期
       const rowDate = row.created_at.split(' ')[0];
       let matchDate = false;
       
@@ -1979,36 +2137,42 @@ app.get('/api/orders/received/preview', async (req, res) => {
       
       if (!matchDate) continue;
       
-      // 僅保留屬於「當前世界」的訂單
-      // 優先從 order_history.worldId 取得（即使訂單被取消也能查詢）
+      const orderItems = await getOrderItems(db, row.order_id);
       let orderWorldId = row.worldId;
-      // 如果 order_history 中沒有 worldId（舊資料），則從 orders 表查詢
-      if (orderWorldId === null || orderWorldId === undefined) {
-        const orderItems = await getOrderItems(db, row.order_id);
-        if (orderItems && orderItems.length > 0) {
-          orderWorldId = orderItems[0].worldId;
-        }
+      if ((orderWorldId === null || orderWorldId === undefined) && orderItems && orderItems.length > 0) {
+        orderWorldId = orderItems[0].worldId;
       }
-      // 如果還是沒有 worldId，跳過此訂單
-      if (orderWorldId === null || orderWorldId === undefined || orderWorldId !== current.worldId) {
-        continue;
-      }
+      if (orderWorldId === null || orderWorldId === undefined) continue;
+      if (filterWorldId !== null ? orderWorldId !== filterWorldId : !ownerWorldIds.includes(orderWorldId)) continue;
       if (isSampleOrder(newData, row)) continue;
       
-      // 將每個品項展開為一行
-      for (const item of newData.items) {
+      if (!vendorMapCache[orderWorldId]) {
+        vendorMapCache[orderWorldId] = await getVendorMap(db, orderWorldId);
+      }
+      const vendorMap = vendorMapCache[orderWorldId];
+      const world = orderWorldId ? await getWorldById(db, orderWorldId) : null;
+      const worldName = world ? (world.name || `世界 #${String(world.id).padStart(6, '0')}`) : '';
+      const worldCode = world?.worldCode || null;
+      const displayItems = (orderItems && orderItems.length > 0)
+        ? orderItems.map(oi => ({ name: oi.item, item: oi.item, qty: oi.qty }))
+        : newData.items;
+      const branchVal = (orderItems && orderItems.length > 0) ? orderItems[0].branch : newData.branch;
+      
+      for (const item of displayItems) {
         const itemName = item.name || item.item || '';
         const vendor = (vendorMap && itemName) ? (resolveVendorForItemName(itemName, vendorMap) || getVendorByItem(itemName) || '') : '';
         
         results.push({
           orderId: row.order_id,
-          branch: newData.branch,
+          branch: branchVal,
           vendor: vendor || '',
           itemName,
           qty: item.qty || 0,
           user: row.user || '',
           userId: row.userId || '',
-          createdAt: row.created_at
+          createdAt: row.created_at,
+          worldName,
+          worldCode
         });
       }
     }
@@ -2066,16 +2230,10 @@ app.get('/api/orders/my', async (req, res) => {
       }
     }
     
-    const dateStr = date || '今天';
-    // 使用資料庫時間計算「今天」（與 created_at 使用相同的時間來源）
-    // SQLite 的 CURRENT_TIMESTAMP 使用系統本地時間，所以我們也用本地時區
+    const dateStr = (date === '' || date === '全部') ? '全部' : (date || '今天');
     const now = new Date();
     const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-  // 額外計算「昨天」：對使用者來說，「今天」預設顯示「今天 + 昨天」的單，避免跨日就查不到昨天下的訂單
-  const yesterdayDate = new Date(now);
-  yesterdayDate.setDate(yesterdayDate.getDate() - 1);
-  const yesterday = `${yesterdayDate.getFullYear()}-${String(yesterdayDate.getMonth() + 1).padStart(2, '0')}-${String(yesterdayDate.getDate()).padStart(2, '0')}`;
-  console.log(`📅 日期查詢: dateStr=${dateStr}, today=${today}, yesterday=${yesterday}, 系統時間=${now.toISOString()}, 本地時間=${now.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}`);
+    console.log(`📅 日期查詢: dateStr=${dateStr}, today=${today}, 本地時間=${now.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}`);
     
     // 從 order_history 查詢「這個使用者」建立的訂單
     const rows = await new Promise((resolve, reject) => {
@@ -2128,8 +2286,7 @@ app.get('/api/orders/my', async (req, res) => {
       let matchDate = false;
       
       if (dateStr === '今天' || dateStr === '今日') {
-        // 「今天」視為「今天 + 昨天」的訂單，確保昨天下的單隔天仍然查得到
-        matchDate = (rowDate === today || rowDate === yesterday);
+        matchDate = (rowDate === today);
       } else if (dateStr === '全部' || dateStr === '') {
         matchDate = true;
       } else {
@@ -2181,10 +2338,15 @@ app.get('/api/orders/my', async (req, res) => {
         }
       }
       
+      // 若訂單仍存在於 orders 表，使用當前品項（含編輯後）；已取消則用建立時快照
+      const displayItems = (orderItems && orderItems.length > 0)
+        ? orderItems.map(oi => ({ name: oi.item, item: oi.item, qty: oi.qty }))
+        : newData.items;
+      
       results.push({
         orderId: row.order_id,
-        branch: newData.branch || '多分店',
-        items: newData.items,
+        branch: (orderItems && orderItems.length > 0) ? orderItems[0].branch : (newData.branch || '多分店'),
+        items: displayItems,
         createdAt: row.created_at,
         user: row.user, // 保留顯示名稱，用於顯示「誰點的」
         worldId: orderWorldId,
@@ -2515,22 +2677,22 @@ app.post('/api/menu/upload-excel', upload.single('file'), async (req, res) => {
       });
     }
     
-    // 嘗試解析 Excel
-    const vendorMap = parseExcelToVendorMap(workbook, mapping);
-    
-    if (!vendorMap) {
+    let vendorMap;
+    try {
+      vendorMap = parseExcelToVendorMap(workbook, mapping);
+    } catch (parseErr) {
       return res.status(400).json({
-        error: '無法解析 Excel 內容',
+        error: parseErr.message || '格式錯誤',
+        details: parseErr.details || '請檢查 Excel 格式或手動設定欄位對應',
         preview,
         detectedMapping,
-        needsMapping: true,
-        message: '請檢查 Excel 格式或手動設定欄位對應'
+        needsMapping: true
       });
     }
     if (vendorKeysLookLikeHash(vendorMap)) {
       return res.status(400).json({
         error: '廠商欄位可能對應錯誤',
-        message: '偵測到似為 ID 或代碼的值。請在欄位對應中將「廠商欄位」設為實際包含廠商名稱的欄位（例如：飲料廠、便當廠），再重新上傳。',
+        details: '偵測到廠商欄位為 ID 或代碼格式。請將「廠商欄位」改為實際包含廠商名稱的欄位（例如：飲料廠、便當廠）',
         needsMapping: true
       });
     }
@@ -2627,27 +2789,26 @@ app.post('/api/menu/parse-excel', upload.single('file'), async (req, res) => {
     } catch (_) { /* ESM 無 cptable 時略過 */ }
     const workbook = XLSX.readFile(req.file.path, { codepage: 65001 });
     
-    // 解析 Excel
-    const vendorMap = parseExcelToVendorMap(workbook, parsedMapping);
-    
-    // 清理上傳的檔案
-    await unlink(req.file.path).catch(() => {});
-    
-    if (!vendorMap) {
+    let vendorMap;
+    try {
+      vendorMap = parseExcelToVendorMap(workbook, parsedMapping);
+    } catch (parseErr) {
+      await unlink(req.file.path).catch(() => {});
       const preview = getExcelPreview(workbook);
-      const errorDetails = {
-        error: '無法解析 Excel 內容，請檢查欄位對應設定',
-        hint: '可能的原因：\n1. 欄位對應設定不正確（品項欄位或數量欄位錯誤）\n2. Excel 資料格式問題（數量為 0 或負數）\n3. 起始行設定錯誤（hasHeader 設定不正確）',
+      return res.status(400).json({
+        error: parseErr.message || '格式錯誤',
+        details: parseErr.details || '請檢查欄位對應設定',
+        hint: parseErr.details ? undefined : '可能原因：品項/數量欄位錯誤、起始行錯誤、數量為 0 或負數',
         mapping: parsedMapping,
-        preview: preview
-      };
-      console.error('❌ Excel 解析失敗:', errorDetails);
-      return res.status(400).json(errorDetails);
+        preview
+      });
     }
+    
+    await unlink(req.file.path).catch(() => {});
     if (vendorKeysLookLikeHash(vendorMap)) {
       return res.status(400).json({
         error: '廠商欄位可能對應錯誤',
-        message: '偵測到似為 ID 或代碼的值。請在欄位對應中將「廠商欄位」設為實際包含廠商名稱的欄位（例如：飲料廠、便當廠），再重新上傳。',
+        details: '偵測到廠商欄位為 ID 或代碼格式。請將「廠商欄位」改為實際包含廠商名稱的欄位（例如：飲料廠、便當廠）',
         needsMapping: true
       });
     }
@@ -2736,7 +2897,10 @@ app.post('/api/menu/preview-excel', upload.single('file'), async (req, res) => {
       await unlink(req.file.path).catch(() => {});
     }
     console.error('❌ 預覽 Excel 失敗:', err);
-    res.status(500).json({ error: err.message || '預覽 Excel 時發生錯誤，請稍後再試' });
+    res.status(400).json({
+      error: '格式錯誤：無法讀取 Excel 檔案',
+      details: err.message || '請確認檔案為有效的 Excel 格式 (.xlsx, .xls, .xlsm)，且檔案未損壞'
+    });
   }
 });
 
@@ -3173,6 +3337,8 @@ app.get('/api/auth/line-login-callback', async (req, res) => {
     if (!tokenResponse.ok) {
       const errorText = await tokenResponse.text();
       console.error('❌ LINE Login Token 取得失敗:', errorText);
+      console.error('    redirect_uri 使用值:', LINE_LOGIN_REDIRECT_URI);
+      console.error('    client_id 前6碼:', LINE_LOGIN_CHANNEL_ID?.slice(0, 6) + '...');
       return res.status(400).json({ error: 'LINE 登入失敗，請重試' });
     }
     
@@ -3380,6 +3546,125 @@ async function notifyOwnerNewOrderAPI(db, worldId, orderId, branch, items, order
     }
   } catch (err) {
     console.error('❌ 通知 owner 時發生錯誤:', err);
+  }
+}
+
+/**
+ * 從 order_history 取得訂單建立者
+ */
+async function getOrdererFromHistory(db, orderId) {
+  return new Promise((resolve) => {
+    db.get(
+      `SELECT userId, user FROM order_history 
+       WHERE order_id = ? AND action_type = '建立訂單' 
+       ORDER BY created_at ASC LIMIT 1`,
+      [orderId],
+      (err, row) => {
+        if (err) return resolve(null);
+        resolve(row ? { userId: row.userId, user: row.user } : null);
+      }
+    );
+  });
+}
+
+/**
+ * 格式化品項列表為通知用字串（依廠商分組）
+ */
+function formatItemsForNotification(worldVendorMap, items) {
+  const vendorItemsMap = {};
+  for (const item of items) {
+    const name = item.name || item.item;
+    const qty = item.qty || 0;
+    let vendor = null;
+    if (worldVendorMap && typeof worldVendorMap === 'object' && name) {
+      vendor = resolveVendorForItemName(name, worldVendorMap);
+    }
+    if (!vendor) vendor = getVendorByItem(name) || '其他';
+    if (!vendorItemsMap[vendor]) vendorItemsMap[vendor] = [];
+    vendorItemsMap[vendor].push({ name, qty });
+  }
+  let text = '';
+  const vendors = Object.keys(vendorItemsMap).sort();
+  vendors.forEach((vendor) => {
+    text += `${vendor}：\n`;
+    vendorItemsMap[vendor].forEach((it) => {
+      text += `• ${it.name} x${it.qty}\n`;
+    });
+    text += `\n`;
+  });
+  return text.trimEnd();
+}
+
+/**
+ * 通知訂單已編輯（老闆與消費者都收到，含原本與變更後資訊）
+ */
+async function notifyOrderEdited(db, worldId, orderId, editorUserId, editorName, beforeItems, afterItems) {
+  if (!worldId) return;
+  try {
+    const world = await getWorldById(db, worldId);
+    if (!world || !world.ownerUserId) return;
+    const ownerUserId = world.ownerUserId;
+    const orderer = await getOrdererFromHistory(db, orderId);
+    const ordererUserId = orderer ? orderer.userId : null;
+    const worldVendorMap = await getVendorMap(db, worldId);
+    const beforeText = formatItemsForNotification(worldVendorMap, beforeItems.map(i => ({ name: i.item || i.name, qty: i.qty })));
+    const afterText = formatItemsForNotification(worldVendorMap, afterItems.map(i => ({ name: i.item || i.name, qty: i.qty })));
+    const msg = `📝 訂單已編輯\n訂單 ID: ${orderId}\n編輯者: ${editorName || '未知'}\n\n【原本】\n${beforeText || '(空)'}\n\n【變更後】\n${afterText || '(空)'}`;
+    const targets = [ownerUserId];
+    if (ordererUserId && ordererUserId !== ownerUserId) {
+      targets.push(ordererUserId);
+    }
+    if (editorUserId && !targets.includes(editorUserId)) {
+      targets.push(editorUserId);
+    }
+    for (const uid of targets) {
+      if (uid) {
+        const success = await pushLineMessage(uid, msg);
+        if (success) {
+          console.log(`✅ 已通知 (${uid}) 訂單 ${orderId} 已編輯`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('❌ 通知訂單編輯時發生錯誤:', err);
+  }
+}
+
+/**
+ * 通知消費者（下單者）訂單已送出（API 版本）
+ */
+async function notifyConsumerNewOrderAPI(db, worldId, orderId, items, consumerUserId, ordererName) {
+  if (!worldId || !consumerUserId) return;
+  try {
+    const worldVendorMap = await getVendorMap(db, worldId);
+    const vendorItemsMap = {};
+    for (const item of items) {
+      let vendor = null;
+      if (worldVendorMap && typeof worldVendorMap === 'object') {
+        vendor = resolveVendorForItemName(item.name, worldVendorMap);
+      }
+      if (!vendor) vendor = getVendorByItem(item.name) || '其他';
+      if (!vendorItemsMap[vendor]) vendorItemsMap[vendor] = [];
+      vendorItemsMap[vendor].push(item);
+    }
+    let msg = `📦 您的訂單已送出\n訂單 ID: ${orderId}\n\n`;
+    const vendors = Object.keys(vendorItemsMap).sort();
+    vendors.forEach((vendor) => {
+      msg += `${vendor}：\n`;
+      vendorItemsMap[vendor].forEach((item) => {
+        msg += `• ${item.name} x${item.qty}\n`;
+      });
+      msg += `\n`;
+    });
+    msg = msg.trimEnd();
+    const success = await pushLineMessage(consumerUserId, msg);
+    if (success) {
+      console.log(`✅ 已通知消費者 (${consumerUserId}) 訂單已送出 (${orderId})`);
+    } else {
+      console.warn(`⚠️ 通知消費者 (${consumerUserId}) 失敗，可能未加 Bot 為好友`);
+    }
+  } catch (err) {
+    console.error('❌ 通知消費者時發生錯誤:', err);
   }
 }
 
