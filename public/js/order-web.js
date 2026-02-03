@@ -94,7 +94,11 @@ const state = {
   orderDetailFetched: null, // null | { orderId, branch, items: [{id, item, qty}], created_at } | 'cancelled'
   orderDetailTab: null,     // 'my_orders' | 'received_orders'
   orderDetailSelectedMenuItem: '',  // 新增品項時選的菜單品項名稱，'' = 其他
-  orderDetailNewItemAttrs: []       // 新增品項時選的屬性值 [val1, val2, ...]
+  orderDetailNewItemAttrs: [],      // 新增品項時選的屬性值 [val1, val2, ...]
+  orderDetailPendingQty: {},        // { [itemId]: qty } 暫存的數量變更
+  orderDetailPendingDeletes: [],    // [itemId] 暫存的刪除
+  orderDetailPendingAdds: [],       // [{ name, qty, tempId }] 暫存的新增
+  orderDetailAddCounter: 0          // 新增品項的遞增 id
 };
 
 // ==================== API 封裝 ====================
@@ -314,6 +318,7 @@ function handleLoginData(data) {
   
   if (state.isOfficialAccountJoined) {
     state.userStatus = 'logged_in_with_official';
+    state.view = 'worlds'; // 登入後第一頁為主世界（依使用說明）
     loadMenu().then(() => render());
   } else {
     state.userStatus = 'logged_in_no_official';
@@ -396,6 +401,7 @@ async function checkAndUpdateOfficialAccountStatus() {
     
     if (isJoined) {
       state.userStatus = 'logged_in_with_official';
+      state.view = 'worlds'; // 登入後第一頁為主世界（依使用說明）
       // 載入世界列表
       await fetchWorlds(state.userId);
       // 載入菜單（如果沒有當前世界，loadMenu 會失敗，這是正常的）
@@ -649,6 +655,11 @@ function render() {
   if (state.menuImageViewOpen) {
     const menuOverlay = renderMenuImageView();
     container.insertAdjacentHTML('beforeend', menuOverlay);
+  }
+  
+  // Excel 匯出欄位對話框開啟時，每次 render 後重新綁定拖曳（改完欄位名稱後即可調整順序）
+  if (state.excelExportColumnsDialogOpen && state.view === 'my_orders') {
+    setTimeout(() => setupExcelExportColumnsDragAndDrop(), 0);
   }
 }
 
@@ -2252,9 +2263,8 @@ function renderMyOrdersPage(container) {
     });
   }
   
-  // 判斷是否為 owner（決定是否顯示「我收到的訂單」tab）
-  const currentWorld = state.worlds && state.worlds.find(w => w.id === state.currentWorldId);
-  const isOwner = currentWorld && currentWorld.role === 'owner';
+  // 判斷是否為 owner（任一世界為 owner 即顯示「我收到的訂單」tab）
+  const isOwner = (state.worlds || []).some(w => w.role === 'owner');
   
   // 判斷是否為日期格式（YYYY-MM-DD）
   const isDateFormat = /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
@@ -2267,7 +2277,10 @@ function renderMyOrdersPage(container) {
         <div class="order-header-actions">
           <select class="world-select" id="my-orders-world-filter" onchange="orderWeb.setMyOrdersWorld(this.value)">
             <option value="all" ${state.myOrdersWorldFilter === 'all' ? 'selected' : ''}>所有世界</option>
-            ${(state.worlds || []).map(w => `
+            ${(currentTab === 'received_orders'
+              ? (state.worlds || []).filter(w => w.role === 'owner')
+              : (state.worlds || [])
+            ).map(w => `
               <option value="${w.id}" ${state.myOrdersWorldFilter === String(w.id) ? 'selected' : ''}>${escapeHtml(w.name || `世界 #${String(w.id).padStart(6, '0')}`)}</option>
             `).join('')}
           </select>
@@ -2347,7 +2360,7 @@ function renderMyOrdersPage(container) {
                     }).join('')}
                   </div>
                   <div class="order-card-actions">
-                    <button type="button" class="btn-order-edit" onclick="orderWeb.openOrderDetailByOrderId(${order.orderId})">查看／編輯</button>
+                    <button type="button" class="btn-order-edit" onclick="orderWeb.openOrderDetailByOrderId(${order.orderId})">${currentTab === 'received_orders' ? '查看' : '查看／編輯'}</button>
                   </div>
                 </div>
               `).join('')}
@@ -2560,12 +2573,17 @@ function switchMyOrdersTab(tab) {
   state.errorMessage = null;
   state.excelExportColumnsDialogOpen = false;
   
-  // 如果切換到「我收到的訂單」，載入 Excel 匯出欄位設定
-  if (tab === 'received_orders' && state.currentWorldId) {
-    const savedColumns = loadExcelExportColumns();
-    if (savedColumns) {
-      state.excelExportColumns = savedColumns;
+  // 切換到「我收到的訂單」時，若當前世界篩選不是 owner 世界則改為「所有世界」
+  if (tab === 'received_orders') {
+    const ownerWorlds = (state.worlds || []).filter(w => w.role === 'owner');
+    if (state.myOrdersWorldFilter && state.myOrdersWorldFilter !== 'all') {
+      const wid = parseInt(state.myOrdersWorldFilter, 10);
+      if (!ownerWorlds.some(w => w.id === wid)) {
+        state.myOrdersWorldFilter = 'all';
+      }
     }
+    const savedColumns = loadExcelExportColumns();
+    if (savedColumns) state.excelExportColumns = savedColumns;
   }
   
   render();
@@ -2579,11 +2597,13 @@ function switchMyOrdersTab(tab) {
 
 /**
  * 載入 Excel 匯出欄位設定（從 localStorage）
+ * 我收到的訂單用 'received'，其他用 currentWorldId
  */
 function loadExcelExportColumns() {
-  if (!state.currentWorldId) return null;
+  const key = state.myOrdersTab === 'received_orders' ? 'received' : state.currentWorldId;
+  if (!key) return null;
   try {
-    const saved = localStorage.getItem(`excelExportColumns_${state.currentWorldId}`);
+    const saved = localStorage.getItem(`excelExportColumns_${key}`);
     if (saved) {
       return JSON.parse(saved);
     }
@@ -2597,8 +2617,9 @@ function loadExcelExportColumns() {
  * 儲存 Excel 匯出欄位設定（到 localStorage）
  */
 function saveExcelExportColumns() {
-  if (!state.currentWorldId) {
-    showError('無法儲存設定：沒有當前世界');
+  const key = state.myOrdersTab === 'received_orders' ? 'received' : state.currentWorldId;
+  if (!key) {
+    showError('無法儲存設定');
     return;
   }
   
@@ -2635,7 +2656,7 @@ function saveExcelExportColumns() {
       }
     });
     
-    localStorage.setItem(`excelExportColumns_${state.currentWorldId}`, JSON.stringify(columns));
+    localStorage.setItem(`excelExportColumns_${key}`, JSON.stringify(columns));
     state.excelExportColumns = columns;
     state.excelExportColumnsDialogOpen = false;
     state.excelExportColumnEditing = null;
@@ -2718,83 +2739,127 @@ function saveExcelColumnLabel(key) {
 }
 
 /**
- * 設定 Excel 匯出欄位的拖曳功能
+ * 設定 Excel 匯出欄位的拖曳功能（中間撐開 + 插入記號）
  */
 function setupExcelExportColumnsDragAndDrop() {
   const container = document.getElementById('excel-export-columns-list');
   if (!container) return;
-  
+
+  // 避免重複綁定：先移除舊的 listeners 與殘留的 placeholder
+  if (container._excelDragAbortController) {
+    container._excelDragAbortController.abort();
+  }
+  container.querySelectorAll('.excel-column-insert-placeholder').forEach((el) => el.remove());
+  const signal = (container._excelDragAbortController = new AbortController()).signal;
+
   let draggedElement = null;
   let draggedIndex = null;
-  
+  let insertIndex = null;
+  let placeholder = null;
+
+  function removeAllPlaceholders() {
+    container.querySelectorAll('.excel-column-insert-placeholder').forEach((el) => el.remove());
+    placeholder = null;
+  }
+
+  function ensurePlaceholder() {
+    if (!placeholder) {
+      placeholder = document.createElement('div');
+      placeholder.className = 'excel-column-insert-placeholder';
+      placeholder.innerHTML = '<span class="excel-column-insert-line"></span><span class="excel-column-insert-text">↓ 放這裡</span>';
+    }
+    return placeholder;
+  }
+
+  function removePlaceholder() {
+    removeAllPlaceholders();
+  }
+
+  function updatePlaceholderPosition(idx) {
+    const items = container.querySelectorAll('.excel-column-item');
+    if (idx < 0 || idx > items.length) return;
+    insertIndex = idx;
+    const ph = ensurePlaceholder();
+    if (idx >= items.length) {
+      container.appendChild(ph);
+    } else {
+      container.insertBefore(ph, items[idx]);
+    }
+  }
+
   container.addEventListener('dragstart', (e) => {
-    if (e.target.classList.contains('excel-column-item')) {
-      draggedElement = e.target;
-      draggedIndex = parseInt(e.target.dataset.index);
-      e.target.style.opacity = '0.5';
+    const item = e.target.closest('.excel-column-item');
+    if (item) {
+      draggedElement = item;
+      draggedIndex = parseInt(item.dataset.index, 10);
+      item.style.opacity = '0.5';
     }
-  });
-  
-  container.addEventListener('dragend', (e) => {
-    if (e.target.classList.contains('excel-column-item')) {
-      e.target.style.opacity = '1';
-      const items = container.querySelectorAll('.excel-column-item');
-      items.forEach(item => {
-        item.classList.remove('drag-over');
-        item.style.background = '';
-      });
+  }, { signal });
+
+  container.addEventListener('dragend', () => {
+    if (draggedElement) {
+      draggedElement.style.opacity = '1';
+      draggedElement = null;
     }
-  });
-  
+    removePlaceholder();
+    insertIndex = null;
+  }, { signal });
+
   container.addEventListener('dragover', (e) => {
     e.preventDefault();
-    const target = e.target.closest('.excel-column-item');
-    if (target && target !== draggedElement) {
-      // 移除其他項目的 drag-over 樣式
-      const items = container.querySelectorAll('.excel-column-item');
-      items.forEach(item => {
-        if (item !== target) item.classList.remove('drag-over');
-      });
-      target.classList.add('drag-over');
-      target.style.background = 'var(--color-primary-light, #e3f2fd)';
+    if (!draggedElement) return;
+    const items = Array.from(container.querySelectorAll('.excel-column-item'));
+    const y = e.clientY;
+    let newInsertIndex = 0;
+
+    for (let i = 0; i < items.length; i++) {
+      const rect = items[i].getBoundingClientRect();
+      if (y < rect.top) {
+        newInsertIndex = i;
+        break;
+      }
+      if (y <= rect.bottom) {
+        const mid = rect.top + rect.height / 2;
+        newInsertIndex = y < mid ? i : i + 1;
+        break;
+      }
+      newInsertIndex = i + 1;
     }
-  });
-  
+
+    if (newInsertIndex !== insertIndex) {
+      removePlaceholder();
+      updatePlaceholderPosition(newInsertIndex);
+    }
+  }, { signal });
+
   container.addEventListener('dragleave', (e) => {
-    const target = e.target.closest('.excel-column-item');
-    if (target) {
-      target.classList.remove('drag-over');
-      target.style.background = '';
+    if (!container.contains(e.relatedTarget)) {
+      removePlaceholder();
+      insertIndex = null;
     }
-  });
-  
+  }, { signal });
+
   container.addEventListener('drop', (e) => {
     e.preventDefault();
-    const target = e.target.closest('.excel-column-item');
-    if (target && draggedElement && target !== draggedElement) {
-      const targetIndex = parseInt(target.dataset.index);
-      
-      // 重新排序陣列
-      const columns = [...state.excelExportColumns];
-      const [removed] = columns.splice(draggedIndex, 1);
-      columns.splice(targetIndex, 0, removed);
-      
-      state.excelExportColumns = columns;
-      
-      // 重新渲染
-      render();
-      setTimeout(() => {
-        setupExcelExportColumnsDragAndDrop();
-      }, 100);
-    } else {
-      // 清除所有拖曳樣式
-      const items = container.querySelectorAll('.excel-column-item');
-      items.forEach(item => {
-        item.classList.remove('drag-over');
-        item.style.background = '';
-      });
-    }
-  });
+    const savedInsertIndex = insertIndex;
+    removePlaceholder();
+    insertIndex = null;
+    if (!draggedElement || savedInsertIndex == null) return;
+
+    const columns = [...state.excelExportColumns];
+    const [removed] = columns.splice(draggedIndex, 1);
+    const insertAt = draggedIndex < savedInsertIndex ? savedInsertIndex - 1 : savedInsertIndex;
+    columns.splice(insertAt, 0, removed);
+    state.excelExportColumns = columns;
+
+    const items = container.querySelectorAll('.excel-column-item');
+    const ref = items[savedInsertIndex] || null;
+    container.insertBefore(draggedElement, ref);
+
+    container.querySelectorAll('.excel-column-item').forEach((el, i) => {
+      el.dataset.index = String(i);
+    });
+  }, { signal });
 }
 
 /**
@@ -2816,17 +2881,13 @@ async function exportReceivedOrdersToExcel() {
   render();
   
   try {
-    // 處理日期參數
     let dateParam = state.myOrdersDate;
-    if (dateParam === '全部') {
-      dateParam = '';
-    } else if (dateParam === '今天' || dateParam === '今日') {
-      dateParam = '今天';
-    } else if (/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
-      dateParam = dateParam;
-    } else {
-      dateParam = '今天';
-    }
+    if (dateParam === '全部') dateParam = '';
+    else if (dateParam === '今天' || dateParam === '今日') dateParam = '今天';
+    else if (!/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) dateParam = '今天';
+    
+    let worldParam = state.myOrdersWorldFilter;
+    if (worldParam === 'all' || !worldParam) worldParam = '';
     
     // 取得欄位設定
     const columns = state.excelExportColumns || loadExcelExportColumns() || [
@@ -2842,8 +2903,7 @@ async function exportReceivedOrdersToExcel() {
     
     const columnsParam = encodeURIComponent(JSON.stringify(columns));
     
-    // 下載 Excel
-    const url = `${API_BASE}/orders/received/export?userId=${encodeURIComponent(state.userId)}&date=${encodeURIComponent(dateParam)}&columns=${columnsParam}`;
+    const url = `${API_BASE}/orders/received/export?userId=${encodeURIComponent(state.userId)}&date=${encodeURIComponent(dateParam)}&columns=${columnsParam}${worldParam ? '&worldId=' + encodeURIComponent(worldParam) : ''}`;
     const response = await fetch(url);
     
     if (!response.ok) {
@@ -2883,7 +2943,7 @@ async function exportReceivedOrdersToExcel() {
 }
 
 /**
- * 查詢我收到的訂單（當前世界的所有訂單，僅 owner）
+ * 查詢我收到的訂單（可選世界與日期，僅 owner）
  * 單一來源：使用 /api/orders/received/preview，並同時建立卡片用的 myOrders 與欄位用的 rows
  */
 async function fetchReceivedOrders() {
@@ -2897,22 +2957,16 @@ async function fetchReceivedOrders() {
   state.errorMessage = null;
   
   try {
-    // 處理日期參數：全部 -> 空字串，今天 -> '今天'，日期格式 -> YYYY-MM-DD
     let dateParam = state.myOrdersDate;
-    if (dateParam === '全部') {
-      dateParam = '';
-    } else if (dateParam === '今天' || dateParam === '今日') {
-      dateParam = '今天';
-    } else if (/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
-      // 已經是 YYYY-MM-DD 格式，直接使用
-      dateParam = dateParam;
-    } else {
-      // 其他情況，預設為今天
-      dateParam = '今天';
-    }
+    if (dateParam === '全部') dateParam = '';
+    else if (dateParam === '今天' || dateParam === '今日') dateParam = '今天';
+    else if (!/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) dateParam = '今天';
     
-    // 使用 preview API，取得欄位與逐品項列
-    const response = await fetch(`${API_BASE}/orders/received/preview?userId=${encodeURIComponent(state.userId)}&date=${encodeURIComponent(dateParam)}`);
+    let worldParam = state.myOrdersWorldFilter;
+    if (worldParam === 'all' || !worldParam) worldParam = '';
+    
+    const url = `${API_BASE}/orders/received/preview?userId=${encodeURIComponent(state.userId)}&date=${encodeURIComponent(dateParam)}${worldParam ? '&worldId=' + encodeURIComponent(worldParam) : ''}`;
+    const response = await fetch(url);
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({ error: '查詢訂單失敗' }));
       throw new Error(errorData.error || '查詢訂單失敗');
@@ -2935,14 +2989,12 @@ async function fetchReceivedOrders() {
           items: [],
           createdAt: r.createdAt,
           user: r.user || '',
-          userId: r.userId || ''
+          userId: r.userId || '',
+          worldName: r.worldName || null,
+          worldCode: r.worldCode || null
         };
       }
-      orderMap[orderId].items.push({
-        name: r.itemName,
-        qty: r.qty
-      });
-      // 更新時間：取最新一筆
+      orderMap[orderId].items.push({ name: r.itemName, qty: r.qty });
       if (r.createdAt && new Date(r.createdAt) > new Date(orderMap[orderId].createdAt)) {
         orderMap[orderId].createdAt = r.createdAt;
       }
@@ -3001,7 +3053,7 @@ function renderReceivedOrdersTable() {
       return `<td>${escapeHtml(String(value))}</td>`;
     }).join('');
     const actionTd = isFirstOfOrder
-      ? `<td><button type="button" class="btn-order-edit-inline" onclick="orderWeb.openOrderDetailByOrderId(${row.orderId})">編輯</button></td>`
+      ? `<td><button type="button" class="btn-order-edit-inline" onclick="orderWeb.openOrderDetailByOrderId(${row.orderId})">查看</button></td>`
       : '<td></td>';
     return `<tr>${tds}${actionTd}</tr>`;
   }).join('');
@@ -3073,6 +3125,10 @@ async function openOrderDetail(order, tab) {
   state.orderDetailOrder = order;
   state.orderDetailTab = tab || state.myOrdersTab;
   state.orderDetailFetched = null;
+  state.orderDetailPendingQty = {};
+  state.orderDetailPendingDeletes = [];
+  state.orderDetailPendingAdds = [];
+  state.orderDetailAddCounter = 0;
   state.errorMessage = null;
   setLoading(true);
   render();
@@ -3168,6 +3224,10 @@ function closeOrderDetail() {
   state.orderDetailTab = null;
   state.orderDetailSelectedMenuItem = '';
   state.orderDetailNewItemAttrs = [];
+  state.orderDetailPendingQty = {};
+  state.orderDetailPendingDeletes = [];
+  state.orderDetailPendingAdds = [];
+  state.orderDetailAddCounter = 0;
   state.errorMessage = null;
   render();
   // 重新載入列表以反映修改
@@ -3206,6 +3266,7 @@ function renderOrderDetailView() {
 
   if (isCancelled) {
     const items = (order && order.items) || [];
+    const canRestore = tab === 'my_orders';
     return `
       <div class="order-detail-panel">
         <div class="order-detail-header">
@@ -3224,37 +3285,51 @@ function renderOrderDetailView() {
               </div>
             `).join('')}
           </div>
-          <button type="button" class="btn-block btn-primary" onclick="orderWeb.restoreOrder()" ${state.isLoading ? 'disabled' : ''}>
+          ${canRestore ? `<button type="button" class="btn-block btn-primary" onclick="orderWeb.restoreOrder()" ${state.isLoading ? 'disabled' : ''}>
             ${state.isLoading ? '處理中...' : '恢復訂單'}
-          </button>
+          </button>` : '<button type="button" class="btn-block btn-primary" onclick="orderWeb.closeOrderDetail()">返回</button>'}
         </div>
       </div>
     `;
   }
 
-  const items = fetched.items || [];
-  const userName = displayName;
+  const baseItems = fetched.items || [];
+  const pendingQty = state.orderDetailPendingQty || {};
+  const pendingDeletes = state.orderDetailPendingDeletes || [];
+  const pendingAdds = state.orderDetailPendingAdds || [];
+  const canEdit = tab === 'my_orders';
 
-  const itemsHtml = items.map(it => `
-    <div class="order-detail-item-row order-detail-item-editable" data-item-id="${it.id}">
-      <span class="item-name">${escapeHtml(it.item || '')}</span>
-      <input type="number" min="1" max="999999" value="${it.qty}" 
-             onchange="orderWeb.updateOrderItemQty(${it.id}, parseInt(this.value, 10) || 1)"
-             class="order-detail-qty-input">
-      <button type="button" class="btn-order-item-delete" onclick="orderWeb.deleteOrderItem(${it.id})" title="刪除此品項">刪除</button>
-    </div>
-  `).join('');
+  const effectiveItems = baseItems
+    .filter(it => !pendingDeletes.includes(it.id))
+    .map(it => ({
+      ...it,
+      qty: pendingQty[it.id] !== undefined ? pendingQty[it.id] : it.qty,
+      isPending: false
+    }))
+    .concat(pendingAdds.map(a => ({ id: a.tempId, item: a.name, qty: a.qty, tempId: a.tempId, isPending: true })));
 
-  return `
-    <div class="order-detail-panel">
-      <div class="order-detail-header">
-        <button type="button" class="btn-back" onclick="orderWeb.closeOrderDetail()">← 返回</button>
-        <span class="order-detail-title">訂單 #${id}</span>
-      </div>
-      <div class="order-detail-body">
-        <p class="order-detail-meta">建立時間：${formatDateTime(fetched.created_at)}</p>
-        ${tab === 'received_orders' && order && order.user ? `<p class="order-detail-meta">下單者：${escapeHtml(order.user)}</p>` : ''}
-        <div class="order-detail-items">${itemsHtml}</div>
+  const itemsHtml = effectiveItems.map(it => {
+    const idArg = typeof it.id === 'number' ? it.id : JSON.stringify(it.tempId || it.id);
+    const qty = it.qty || 1;
+    return canEdit
+      ? `<div class="order-detail-item-row order-detail-item-editable" data-item-id="${it.id}">
+          <span class="item-name">${escapeHtml(it.item || '')}</span>
+          <div class="btn-qty-wrap order-detail-qty-wrap">
+            <button type="button" class="btn-qty" onclick="orderWeb.adjustOrderItemQtyLocal(${idArg}, -1)" ${qty <= 1 ? 'disabled' : ''}>−</button>
+            <input type="number" min="1" max="999999" value="${qty}" 
+                   onchange="orderWeb.updateOrderItemQtyLocal(${idArg}, Math.max(1, parseInt(this.value, 10) || 1))"
+                   class="order-detail-qty-input">
+            <button type="button" class="btn-qty" onclick="orderWeb.adjustOrderItemQtyLocal(${idArg}, 1)">＋</button>
+          </div>
+          <button type="button" class="btn-order-item-delete" onclick="orderWeb.deleteOrderItemLocal(${idArg})" title="刪除此品項">刪除</button>
+        </div>`
+      : `<div class="order-detail-item-row">
+          <span class="item-name">${escapeHtml(it.item || '')}</span>
+          <span class="item-qty">x${it.qty || 0}</span>
+        </div>`;
+  }).join('');
+
+  const addItemSection = canEdit ? `
         <div class="order-detail-add-item">
           <label>新增品項（從該世界菜單選擇）</label>
           ${(function() {
@@ -3294,123 +3369,192 @@ function renderOrderDetailView() {
             }
             return '';
           })()}
-          <input type="number" min="1" max="999999" id="order-detail-new-item-qty" value="1" class="order-detail-new-qty">
-          <button type="button" class="btn-secondary" onclick="orderWeb.addOrderItemFromInput()">新增</button>
+          <div class="btn-qty-wrap order-detail-new-qty-wrap">
+            <button type="button" class="btn-qty" onclick="orderWeb.adjustOrderDetailNewItemQty(-1)" id="order-detail-new-qty-minus">−</button>
+            <input type="number" min="1" max="999999" id="order-detail-new-item-qty" value="1" class="order-detail-new-qty" onchange="orderWeb.setOrderDetailNewItemQty(parseInt(this.value, 10) || 1)">
+            <button type="button" class="btn-qty" onclick="orderWeb.adjustOrderDetailNewItemQty(1)">＋</button>
+          </div>
+          <button type="button" class="btn-add-item" onclick="orderWeb.addOrderItemLocal()">＋ 新增</button>
         </div>
+        <button type="button" class="btn-block btn-primary" onclick="orderWeb.confirmOrderEdit()" style="margin-bottom: 0.5rem;">
+          確定編輯
+        </button>
         <button type="button" class="btn-block btn-danger-outline" onclick="orderWeb.cancelOrderConfirm()" ${state.isLoading ? 'disabled' : ''}>
           取消此訂單
-        </button>
+        </button>`
+  : `<button type="button" class="btn-block btn-primary" onclick="orderWeb.closeOrderDetail()">返回</button>`;
+
+  return `
+    <div class="order-detail-panel">
+      <div class="order-detail-header">
+        <button type="button" class="btn-back" onclick="orderWeb.closeOrderDetail()">← 返回</button>
+        <span class="order-detail-title">訂單 #${id}</span>
+      </div>
+      <div class="order-detail-body">
+        <p class="order-detail-meta">建立時間：${formatDateTime(fetched.created_at)}</p>
+        ${tab === 'received_orders' && order && order.user ? `<p class="order-detail-meta">下單者：${escapeHtml(order.user)}</p>` : ''}
+        <div class="order-detail-items">${itemsHtml}</div>
+        ${addItemSection}
       </div>
     </div>
   `;
 }
 
 /**
- * 更新訂單品項數量
+ * 暫存數量變更（確定編輯時才送出）
  */
-async function updateOrderItemQty(itemId, qty) {
-  if (!state.userId || !state.orderDetailOrderId) return;
-  setLoading(true);
-  try {
-    const res = await fetch(`${API_BASE}/orders/items/${itemId}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        qty,
-        userId: state.userId,
-        user: state.lineProfile?.displayName || null
-      })
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || '更新數量失敗');
-    }
-    state.orderDetailFetched = await fetchOrderDetail(state.orderDetailOrderId);
-    render();
-  } catch (e) {
-    showError(e.message || '更新數量失敗');
-  } finally {
-    setLoading(false);
-    render();
+function updateOrderItemQtyLocal(itemIdOrTempId, qty) {
+  const id = typeof itemIdOrTempId === 'string' && itemIdOrTempId.startsWith('add-') ? itemIdOrTempId : Number(itemIdOrTempId);
+  if (typeof id === 'number' && !isNaN(id)) {
+    state.orderDetailPendingQty = state.orderDetailPendingQty || {};
+    state.orderDetailPendingQty[id] = qty;
+  } else if (typeof id === 'string') {
+    const adds = state.orderDetailPendingAdds || [];
+    const found = adds.find(a => (a.tempId || '').toString() === id);
+    if (found) found.qty = qty;
   }
+  render();
+}
+
+function getOrderDetailItemQty(itemIdOrTempId) {
+  const baseItems = (state.orderDetailFetched?.items) || [];
+  const pendingQty = state.orderDetailPendingQty || {};
+  const pendingAdds = state.orderDetailPendingAdds || [];
+  const id = typeof itemIdOrTempId === 'string' && itemIdOrTempId.startsWith('add-') ? itemIdOrTempId : Number(itemIdOrTempId);
+  if (typeof id === 'number' && !isNaN(id)) {
+    if (pendingQty[id] !== undefined) return pendingQty[id];
+    const base = baseItems.find(it => it.id === id);
+    return base ? base.qty : 1;
+  }
+  const add = pendingAdds.find(a => (a.tempId || '').toString() === String(itemIdOrTempId));
+  return add ? add.qty : 1;
+}
+
+function adjustOrderItemQtyLocal(itemIdOrTempId, delta) {
+  const current = getOrderDetailItemQty(itemIdOrTempId);
+  updateOrderItemQtyLocal(itemIdOrTempId, Math.max(1, Math.min(999999, current + delta)));
+}
+
+function adjustOrderDetailNewItemQty(delta) {
+  const input = document.getElementById('order-detail-new-item-qty');
+  const current = input ? (parseInt(input.value, 10) || 1) : 1;
+  const next = Math.max(1, Math.min(999999, current + delta));
+  if (input) input.value = next;
+}
+
+function setOrderDetailNewItemQty(qty) {
+  const input = document.getElementById('order-detail-new-item-qty');
+  if (input) input.value = Math.max(1, Math.min(999999, qty || 1));
 }
 
 /**
- * 刪除訂單品項
+ * 暫存刪除（確定編輯時才送出）
  */
-async function deleteOrderItem(itemId) {
-  if (!state.userId || !confirm('確定要刪除此品項？')) return;
-  setLoading(true);
-  try {
-    const res = await fetch(`${API_BASE}/orders/items/${itemId}`, {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userId: state.userId,
-        user: state.lineProfile?.displayName || null
-      })
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || '刪除失敗');
+function deleteOrderItemLocal(itemIdOrTempId) {
+  const id = itemIdOrTempId;
+  if (typeof id === 'string' && id.startsWith('add-')) {
+    state.orderDetailPendingAdds = (state.orderDetailPendingAdds || []).filter(a => (a.tempId || '').toString() !== id);
+  } else {
+    const numId = Number(id);
+    if (!isNaN(numId)) {
+      state.orderDetailPendingDeletes = state.orderDetailPendingDeletes || [];
+      if (!state.orderDetailPendingDeletes.includes(numId)) {
+        state.orderDetailPendingDeletes.push(numId);
+      }
     }
-    const data = await fetchOrderDetail(state.orderDetailOrderId);
-    if (data && data.items && data.items.length === 0) {
-      closeOrderDetail();
-      return;
-    }
-    state.orderDetailFetched = data || 'cancelled';
-    render();
-  } catch (e) {
-    showError(e.message || '刪除失敗');
-  } finally {
-    setLoading(false);
-    render();
   }
+  render();
 }
 
 /**
- * 從菜單選擇（含屬性）取得名稱與數量並新增品項
+ * 暫存新增品項（確定編輯時才送出）
  */
-async function addOrderItemFromInput() {
+function addOrderItemLocal() {
   const selectEl = document.getElementById('order-detail-menu-select');
   const qtyEl = document.getElementById('order-detail-new-item-qty');
   if (!qtyEl || !state.userId || !state.orderDetailOrderId) return;
 
   const baseName = (state.orderDetailSelectedMenuItem || '').trim();
-  const attrs = (state.orderDetailNewItemAttrs || []).filter(Boolean);
-  const name = baseName ? (attrs.length > 0 ? `${baseName} ${attrs.join(' ')}` : baseName) : '';
-
-  const qty = parseInt(qtyEl.value, 10) || 1;
-  if (!name) {
+  if (!baseName) {
     showError('請從菜單選擇品項');
     return;
   }
 
+  // 有屬性的品項必須完整填寫每個維度
+  const { dimensionNames, optionsPerDimension } = getAttributeDimensionsAndOptions(baseName);
+  const requiredDims = optionsPerDimension
+    .map((opts, i) => ({ index: i, name: dimensionNames[i] || ('屬性' + (i + 1)), options: opts || [] }))
+    .filter(d => d.options.length > 0);
+  const attrs = state.orderDetailNewItemAttrs || [];
+  for (const dim of requiredDims) {
+    const val = (attrs[dim.index] || '').trim();
+    if (!val || !dim.options.includes(val)) {
+      showError(`請選擇完整的屬性：${requiredDims.map(d => d.name).join('、')}`);
+      return;
+    }
+  }
+  const attrsFiltered = requiredDims.map(d => attrs[d.index]);
+  const name = attrsFiltered.length > 0 ? `${baseName} ${attrsFiltered.join(' ')}` : baseName;
+
+  const qty = parseInt(qtyEl.value, 10) || 1;
+
+  state.orderDetailPendingAdds = state.orderDetailPendingAdds || [];
+  state.orderDetailAddCounter = (state.orderDetailAddCounter || 0) + 1;
+  state.orderDetailPendingAdds.push({ name, qty, tempId: 'add-' + state.orderDetailAddCounter });
+  state.orderDetailSelectedMenuItem = '';
+  state.orderDetailNewItemAttrs = [];
+  if (selectEl) selectEl.value = '';
+  qtyEl.value = '1';
+  render();
+}
+
+/**
+ * 確定編輯：送出所有暫存變更，完成後發送通知
+ */
+async function confirmOrderEdit() {
+  if (!state.userId || !state.orderDetailOrderId) return;
+  const pendingQty = state.orderDetailPendingQty || {};
+  const pendingDeletes = state.orderDetailPendingDeletes || [];
+  const pendingAdds = state.orderDetailPendingAdds || [];
+  const baseItems = (state.orderDetailFetched && state.orderDetailFetched !== 'cancelled' && state.orderDetailFetched.items) || [];
+
+  const hasChanges = Object.keys(pendingQty).length > 0 || pendingDeletes.length > 0 || pendingAdds.length > 0;
+  if (!hasChanges) {
+    closeOrderDetail();
+    return;
+  }
+
+  const qtyUpdates = [];
+  for (const [k, v] of Object.entries(pendingQty)) {
+    const id = parseInt(k, 10);
+    if (!isNaN(id) && baseItems.some(it => it.id === id)) {
+      qtyUpdates.push({ itemId: id, qty: v });
+    }
+  }
+
+  const adds = pendingAdds.map(a => ({ name: a.name, qty: a.qty }));
+
   setLoading(true);
   try {
-    const res = await fetch(`${API_BASE}/orders/${state.orderDetailOrderId}/items`, {
+    const res = await fetch(`${API_BASE}/orders/${state.orderDetailOrderId}/batch-edit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        name,
-        qty,
         userId: state.userId,
-        user: state.lineProfile?.displayName || null
+        user: state.lineProfile?.displayName || null,
+        qtyUpdates,
+        adds,
+        deletes: pendingDeletes
       })
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || '新增品項失敗');
+      throw new Error(err.error || '編輯失敗');
     }
-    state.orderDetailFetched = await fetchOrderDetail(state.orderDetailOrderId);
-    state.orderDetailSelectedMenuItem = '';
-    state.orderDetailNewItemAttrs = [];
-    if (selectEl) selectEl.value = '';
-    qtyEl.value = '1';
-    render();
+    closeOrderDetail();
   } catch (e) {
-    showError(e.message || '新增品項失敗');
+    showError(e.message || '編輯失敗');
+    render();
   } finally {
     setLoading(false);
     render();
@@ -4015,8 +4159,10 @@ async function handleExcelFileSelect(event) {
     });
     
     if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error || '預覽 Excel 失敗');
+      const errorData = await response.json().catch(() => ({}));
+      const err = new Error(errorData.error || '預覽 Excel 失敗');
+      err.errorData = errorData;
+      throw err;
     }
     
     const data = await response.json();
@@ -4029,6 +4175,7 @@ async function handleExcelFileSelect(event) {
     if (!state.excelPreview || !Array.isArray(state.excelPreview) || state.excelPreview.length === 0) {
       state.errorMessage = '無法讀取 Excel 檔案內容，請確認檔案格式是否正確';
       state.excelNeedsMapping = true;
+      alert('❌ Excel 格式錯誤\n\n無法讀取檔案內容。請確認：\n• 檔案為有效 Excel 格式 (.xlsx, .xls, .xlsm)\n• 工作表中有資料\n• 檔案未損壞');
       state.excelMapping = { itemColumn: 'B', qtyColumn: 'C', attrColumn: '', hasHeader: true, startRow: 2 };
       setLoading(false);
       render();
@@ -4061,32 +4208,18 @@ async function handleExcelFileSelect(event) {
     }
   } catch (error) {
     console.error('處理 Excel 檔案失敗:', error);
-    // 嘗試從錯誤回應中取得詳細訊息
     let errorMsg = error.message || '處理 Excel 檔案時發生錯誤';
-    
-    // 如果錯誤是從 fetch 來的，嘗試解析回應
-    if (error.response) {
-      try {
-        const errorData = await error.response.clone().json().catch(() => null);
-        if (errorData) {
-          if (errorData.error) {
-            errorMsg = errorData.error;
-          }
-          if (errorData.hint) {
-            errorMsg += '\n\n' + errorData.hint;
-          }
-          // 如果有預覽資料，保留它
-          if (errorData.preview && Array.isArray(errorData.preview) && errorData.preview.length > 0) {
-            state.excelPreview = errorData.preview;
-          }
-        }
-      } catch (e) {
-        // 忽略解析錯誤
-        console.error('解析錯誤回應失敗:', e);
-      }
+    const errorData = error.errorData || {};
+    if (errorData.details) {
+      errorMsg = `${errorData.error || errorMsg}\n\n📌 出錯位置／原因：\n${errorData.details}`;
+    } else if (errorData.hint) {
+      errorMsg += '\n\n' + errorData.hint;
     }
-    
+    if (errorData.preview && Array.isArray(errorData.preview) && errorData.preview.length > 0) {
+      state.excelPreview = errorData.preview;
+    }
     state.errorMessage = errorMsg;
+    alert('❌ Excel 格式錯誤\n\n' + errorMsg);
     state.excelNeedsMapping = true;
     // 設定預設值
     if (!state.excelMapping) {
@@ -4187,19 +4320,17 @@ async function submitExcelMapping() {
     await uploadExcelWithMapping(mapping, state.excelUploadFile);
   } catch (error) {
     console.error('匯入失敗:', error);
-    // 嘗試從錯誤資料中取得詳細訊息
     let errorMsg = error.message || '匯入 Excel 時發生錯誤';
-    if (error.errorData) {
-      if (error.errorData.hint) {
-        // 將換行符轉換為 HTML 換行
-        const hint = error.errorData.hint.replace(/\n/g, '<br>');
-        errorMsg = `${error.errorData.error || '匯入失敗'}<br><br>${hint}`;
-      } else if (error.errorData.error) {
-        errorMsg = error.errorData.error;
-      }
+    const ed = error.errorData || {};
+    if (ed.details) {
+      errorMsg = `${ed.error || errorMsg}\n\n📌 出錯位置／原因：\n${ed.details}`;
+    } else if (ed.hint) {
+      errorMsg = `${ed.error || errorMsg}\n\n${ed.hint}`;
+    } else if (ed.error) {
+      errorMsg = ed.error;
     }
-    // 確保錯誤訊息正確顯示（支援多行）
-    state.errorMessage = errorMsg;
+    state.errorMessage = ed.details ? `${ed.error || '格式錯誤'}\n\n${ed.details}`.replace(/\n/g, '<br>') : errorMsg.replace(/\n/g, '<br>');
+    alert('❌ Excel 格式錯誤\n\n' + errorMsg);
     // 確保顯示錯誤訊息和欄位設定 UI
     state.excelNeedsMapping = true;
     // 確保預覽仍然顯示
@@ -5072,9 +5203,13 @@ window.orderWeb = {
   closeOrderDetail,
   setOrderDetailSelectedMenuItem,
   setOrderDetailNewItemAttr,
-  updateOrderItemQty,
-  deleteOrderItem,
-  addOrderItemFromInput,
+  updateOrderItemQtyLocal,
+  adjustOrderItemQtyLocal,
+  adjustOrderDetailNewItemQty,
+  setOrderDetailNewItemQty,
+  deleteOrderItemLocal,
+  addOrderItemLocal,
+  confirmOrderEdit,
   cancelOrderConfirm,
   restoreOrder,
   render
