@@ -152,11 +152,27 @@ async function fetchWorlds(userId) {
     const data = await response.json();
     if (data.success && Array.isArray(data.worlds)) {
       state.worlds = data.worlds;
-      
-      // 如果有當前世界，更新 worldCode
-      if (state.currentWorldId) {
-        const currentWorldInfo = data.worlds.find(w => w.id === state.currentWorldId);
+
+      // 從後端同步當前世界（解決建立新世界後仍顯示其他世界菜單的問題）
+      if (data.currentWorldId != null) {
+        state.currentWorldId = data.currentWorldId;
+        const currentWorldInfo = data.worlds.find(w => w.id === data.currentWorldId);
         if (currentWorldInfo) {
+          state.currentWorldName = currentWorldInfo.name || `世界 #${String(data.currentWorldId).padStart(6, '0')}`;
+          state.currentWorldCode = currentWorldInfo.worldCode || null;
+        } else {
+          state.currentWorldName = '當前 世界名稱';
+          state.currentWorldCode = null;
+        }
+      } else if (state.currentWorldId) {
+        // 後端無 currentWorldId 時，若前端有選中的世界，檢查是否仍在列表中
+        const currentWorldInfo = data.worlds.find(w => w.id === state.currentWorldId);
+        if (!currentWorldInfo) {
+          state.currentWorldId = null;
+          state.currentWorldName = '當前 世界名稱';
+          state.currentWorldCode = null;
+          state.menu = null;
+        } else {
           state.currentWorldCode = currentWorldInfo.worldCode || null;
         }
       }

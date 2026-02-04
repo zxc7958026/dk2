@@ -1388,9 +1388,20 @@ app.get('/api/worlds', async (req, res) => {
     }
     
     const worlds = await getAllWorldsForUser(db, userId);
-    
+    let currentWorldId = await getCurrentWorld(db, userId);
+
+    // 若無當前世界，自動設定第一個 active 世界為當前
+    if (!currentWorldId && worlds.length > 0) {
+      const activeWorld = worlds.find((w) => w.status === 'active');
+      if (activeWorld) {
+        currentWorldId = activeWorld.worldId;
+        await setCurrentWorld(db, userId, currentWorldId);
+      }
+    }
+
     res.json({
       success: true,
+      currentWorldId: currentWorldId || null,
       worlds: worlds.map(w => ({
         id: w.worldId,
         name: w.name || `世界 #${String(w.worldId).padStart(6, '0')}`,
@@ -2505,7 +2516,10 @@ app.get('/api/menu', async (req, res) => {
         }
       );
     });
-    
+
+    // 防止快取：菜單依 currentWorld 變動，快取會導致顯示錯誤世界的菜單
+    res.set('Cache-Control', 'no-store');
+
     res.json({
       menu: vendorMap,
       formatted,
