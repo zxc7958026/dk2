@@ -3473,12 +3473,13 @@ async function checkUserJoinedOfficialAccount(userId) {
   }
 }
 
-// 啟動伺服器
+// 啟動伺服器（監聽 0.0.0.0 讓同 WiFi 的手機可用電腦 IP 連入）
 const PORT = process.env.PORT || 3001;
-const server = app.listen(PORT, () => {
-  console.log(`🚀 伺服器運行在 port ${PORT}`);
+const HOST = '0.0.0.0';
+const server = app.listen(PORT, HOST, () => {
+  console.log(`🚀 伺服器運行在 http://localhost:${PORT}`);
   console.log(`📡 Webhook 端點: http://localhost:${PORT}/webhook/line`);
-  console.log(`🌐 Web 前端: http://localhost:${PORT}`);
+  console.log(`🌐 同 WiFi 手機請用: http://<此電腦IP>:${PORT} （本機用 localhost:${PORT}）`);
 });
 server.on('error', (err) => {
   console.error('❌ 伺服器啟動失敗:', err.message);
