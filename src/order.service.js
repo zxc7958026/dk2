@@ -111,41 +111,46 @@ export async function createOrder(db, branch, items, user = null, worldId = null
 }
 
 /**
- * 查詢訂單（根據日期和分店）
+ * 查詢訂單（根據日期，可選分店與世界）
+ * @param {string} dateStr - 今天/今日 或 YYYY-MM-DD
+ * @param {string} [branch] - 分店篩選，傳 '' 或不傳則不過濾分店（無分店時用）
+ * @param {number} [worldId] - 世界 ID，傳入則只回該世界的訂單
  */
-export function queryOrdersByDateAndBranch(db, dateStr, branch) {
+export function queryOrdersByDateAndBranch(db, dateStr, branch, worldId) {
   return new Promise((resolve, reject) => {
-    // 從 order_history 查詢建立訂單的記錄
-    db.all(
-      `SELECT * FROM order_history 
-       WHERE action_type = '建立訂單'
-       ORDER BY created_at DESC`,
-      [],
-      (err, rows) => {
-        if (err) {
-          reject(err);
-          return;
-        }
+    const params = [];
+    let sql = `SELECT * FROM order_history WHERE action_type = '建立訂單'`;
+    if (worldId != null) {
+      sql += ` AND worldId = ?`;
+      params.push(worldId);
+    }
+    sql += ` ORDER BY created_at DESC`;
 
-        // 過濾並格式化結果
-        const results = [];
-        const today = new Date().toISOString().split('T')[0];
-        
-        for (const row of rows) {
-          let newData;
-          try {
-            newData = JSON.parse(row.new_data);
-          } catch (err) {
-            console.error('❌ 解析訂單資料失敗 (order_id:', row.order_id, '):', err);
-            continue; // 跳過損壞的記錄
-          }
-          if (!newData || typeof newData !== 'object' || !newData.branch || !Array.isArray(newData.items)) {
-            console.error('❌ 訂單資料格式錯誤 (order_id:', row.order_id, ')');
-            continue;
-          }
-          
-          // 檢查分店
-          if (newData.branch !== branch) continue;
+    db.all(sql, params, (err, rows) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      const results = [];
+      const today = new Date().toISOString().split('T')[0];
+
+      for (const row of rows) {
+        let newData;
+        try {
+          newData = JSON.parse(row.new_data);
+        } catch (err) {
+          console.error('❌ 解析訂單資料失敗 (order_id:', row.order_id, '):', err);
+          continue;
+        }
+        if (!newData || typeof newData !== 'object' || !Array.isArray(newData.items)) {
+          continue;
+        }
+        if (worldId != null && row.worldId != null && row.worldId !== worldId) continue;
+        // 有傳 branch 且非空字串時才依分店篩選
+        if (branch !== undefined && branch !== null && branch !== '') {
+          if ((newData.branch || '') !== branch) continue;
+        }
           
           // 檢查日期
           const rowDate = row.created_at.split(' ')[0];
@@ -168,91 +173,80 @@ export function queryOrdersByDateAndBranch(db, dateStr, branch) {
             }
           }
           
-          if (matchDate) {
-            results.push({
-              orderId: row.order_id,
-              branch: newData.branch,
-              items: newData.items,
-              createdAt: row.created_at
-            });
-          }
+        if (matchDate) {
+          results.push({
+            orderId: row.order_id,
+            branch: newData.branch || '',
+            items: newData.items,
+            createdAt: row.created_at
+          });
         }
-        
-        resolve(results);
       }
-    );
+
+      resolve(results);
+    });
   });
 }
 
 /**
- * 查詢指定日期的所有訂單（老闆查詢，不分分店）
+ * 查詢指定日期的所有訂單（老闆查詢，可依世界篩選）
+ * @param {number} [worldId] - 若傳入則只回該世界的訂單
  */
-export function queryAllOrdersByDate(db, dateStr) {
+export function queryAllOrdersByDate(db, dateStr, worldId) {
   return new Promise((resolve, reject) => {
-    // 從 order_history 查詢建立訂單的記錄
-    db.all(
-      `SELECT * FROM order_history 
-       WHERE action_type = '建立訂單'
-       ORDER BY created_at DESC`,
-      [],
-      (err, rows) => {
-        if (err) {
-          reject(err);
-          return;
-        }
+    let sql = `SELECT * FROM order_history WHERE action_type = '建立訂單'`;
+    const params = [];
+    if (worldId != null) {
+      sql += ` AND worldId = ?`;
+      params.push(worldId);
+    }
+    sql += ` ORDER BY created_at DESC`;
 
-        // 過濾並格式化結果
-        const results = [];
-        const today = new Date().toISOString().split('T')[0];
-        
-        for (const row of rows) {
-          let newData;
-          try {
-            newData = JSON.parse(row.new_data);
-          } catch (err) {
-            console.error('❌ 解析訂單資料失敗 (order_id:', row.order_id, '):', err);
-            continue; // 跳過損壞的記錄
-          }
-          if (!newData || typeof newData !== 'object' || !newData.branch || !Array.isArray(newData.items)) {
-            console.error('❌ 訂單資料格式錯誤 (order_id:', row.order_id, ')');
-            continue;
-          }
-          
-          // 檢查日期
-          const rowDate = row.created_at.split(' ')[0];
-          let matchDate = false;
-          
-          if (dateStr === '今天' || dateStr === '今日') {
-            matchDate = (rowDate === today);
+    db.all(sql, params, (err, rows) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      const results = [];
+      const today = new Date().toISOString().split('T')[0];
+
+      for (const row of rows) {
+        let newData;
+        try {
+          newData = JSON.parse(row.new_data);
+        } catch (err) {
+          console.error('❌ 解析訂單資料失敗 (order_id:', row.order_id, '):', err);
+          continue;
+        }
+        if (!newData || typeof newData !== 'object' || !Array.isArray(newData.items)) {
+          continue;
+        }
+        const rowDate = row.created_at.split(' ')[0];
+        let matchDate = false;
+        if (dateStr === '今天' || dateStr === '今日') {
+          matchDate = (rowDate === today);
+        } else {
+          const dateMatch = dateStr.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+          if (dateMatch) {
+            const targetDate = `${dateMatch[1]}-${dateMatch[2].padStart(2, '0')}-${dateMatch[3].padStart(2, '0')}`;
+            matchDate = (rowDate === targetDate);
           } else {
-            // 嘗試解析日期格式 YYYY-MM-DD
-            const dateMatch = dateStr.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
-            if (dateMatch) {
-              const year = dateMatch[1];
-              const month = dateMatch[2].padStart(2, '0');
-              const day = dateMatch[3].padStart(2, '0');
-              const targetDate = `${year}-${month}-${day}`;
-              matchDate = (rowDate === targetDate);
-            } else {
-              // 如果無法解析日期，則匹配所有日期
-              matchDate = true;
-            }
-          }
-          
-          if (matchDate) {
-            results.push({
-              orderId: row.order_id,
-              branch: newData.branch,
-              items: newData.items,
-              createdAt: row.created_at,
-              lineDisplayName: row.user || null,
-            });
+            matchDate = true;
           }
         }
-        
-        resolve(results);
+        if (matchDate) {
+          results.push({
+            orderId: row.order_id,
+            branch: newData.branch != null ? newData.branch : '',
+            items: newData.items,
+            createdAt: row.created_at,
+            lineDisplayName: row.user || null,
+          });
+        }
       }
-    );
+      resolve(results);
+    });
   });
 }
 
@@ -285,7 +279,7 @@ export function formatOrdersByVendor(orders) {
     output += `${vendor}\n`;
     const branches = Object.keys(vendorMap[vendor]).sort();
     for (const branch of branches) {
-      output += ` ${branch}\n`;
+      if (branch !== '') output += ` ${branch}\n`;
       const items = Object.keys(vendorMap[vendor][branch]).sort();
       for (const itemName of items) {
         const rec = vendorMap[vendor][branch][itemName];

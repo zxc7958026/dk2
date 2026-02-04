@@ -23,7 +23,7 @@ import {
 } from './order.service.js';
 import { verifyLineSignature, handleLineEvent, pushLineMessage } from './line.handler.js';
 import { getVendorByItem, getVendorMap, formatVendorMap, addItemToMenu, removeItemFromMenu, updateMenuItem, resolveVendorForItemName } from './vendorMap.service.js';
-import { getBindings, getWorldById, updateMenuImageUrl, getCurrentWorld, setCurrentWorld, createWorld, bindUserToWorld, updateWorldStatus, updateWorldName, updateOrderFormat, updateDisplayFormat, getAllWorldsForUser, getWorldByCode, getWorldMembers, unbindUserFromWorld, updateExcelMapping, getExcelMapping, getBindingByUserAndWorld, updateItemAttributeOptions } from './world.service.js';
+import { getBindings, getWorldById, updateMenuImageUrl, getCurrentWorld, setCurrentWorld, createWorld, bindUserToWorld, updateWorldStatus, updateWorldName, updateOrderFormat, updateDisplayFormat, getAllWorldsForUser, getWorldByCode, getWorldMembers, unbindUserFromWorld, deleteWorldPermanently, updateExcelMapping, getExcelMapping, getBindingByUserAndWorld, updateItemAttributeOptions } from './world.service.js';
 import { detectExcelMapping, parseExcelToVendorMap, parseExcelToItemAttributeOptions, getExcelPreview } from './excel.service.js';
 import { saveVendorMap } from './vendorMap.service.js';
 import multer from 'multer';
@@ -1020,15 +1020,27 @@ app.get('/api/boss-query', async (req, res) => {
     const bindings = await getBindings(db, userId);
     const isActive = bindings.some((b) => b.status === 'active');
     if (!isActive) {
-      const msg = bindings.length === 0 ? '您尚未加入任何世界' : '此世界尚未完成設定\n・員工請等待老闆完成設定\n・老闆可繼續進行設定';
+      const msg = bindings.length === 0 ? '您尚未加入任何世界' : '此世界尚未完成設定\n・消費者請等待老闆完成設定\n・老闆可繼續進行設定';
       return res.status(403).json({ error: msg });
+    }
+
+    let worldId = await getCurrentWorld(db, userId);
+    if (!worldId && bindings.length > 0) {
+      const activeBinding = bindings.find((b) => b.status === 'active');
+      if (activeBinding) {
+        worldId = activeBinding.worldId;
+        await setCurrentWorld(db, userId, worldId);
+      }
+    }
+    if (!worldId) {
+      return res.status(403).json({ error: '請先選擇或加入一個世界' });
     }
     
     if (!date) {
       return res.status(400).json({ error: '缺少必要參數：date' });
     }
 
-    const results = await queryAllOrdersByDate(db, date);
+    const results = await queryAllOrdersByDate(db, date, worldId);
     
     if (results.length === 0) {
       return res.json({
@@ -1633,12 +1645,12 @@ app.post('/api/worlds/leave', async (req, res) => {
       return res.status(404).json({ error: '您尚未加入此世界' });
     }
     
-    // 檢查是否為世界擁有者
+    // 世界擁有者（老闆）請使用「刪除世界」API，會永久刪除該世界所有內容
     if (binding.role === 'owner') {
-      return res.status(403).json({ error: '世界擁有者無法退出世界' });
+      return res.status(403).json({ error: '世界擁有者請使用「刪除世界」功能；刪除後該世界所有內容將永久刪除，無法復原。' });
     }
     
-    // 退出世界
+    // 消費者：退出世界（僅解除綁定）
     await unbindUserFromWorld(db, userId, worldId);
     
     // 如果當前世界是此世界，清除或更新當前世界設定
@@ -1666,6 +1678,49 @@ app.post('/api/worlds/leave', async (req, res) => {
   } catch (err) {
     console.error('❌ 退出世界失敗:', err);
     res.status(500).json({ error: '退出世界時發生錯誤，請稍後再試' });
+  }
+});
+
+/**
+ * 刪除世界（僅世界擁有者/老闆）
+ * POST /api/worlds/delete
+ * Body: { userId: string, worldId: number, confirm: 'DELETE' }
+ * 需傳 confirm: 'DELETE' 才執行，刪除後該世界所有內容（訂單、歷史、菜單、成員等）永久刪除，無法復原。
+ */
+app.post('/api/worlds/delete', async (req, res) => {
+  try {
+    const { userId, worldId, confirm } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: '缺少必要參數：userId' });
+    }
+    if (worldId == null || typeof worldId !== 'number') {
+      return res.status(400).json({ error: '缺少必要參數：worldId 或格式錯誤' });
+    }
+    if (confirm !== 'DELETE') {
+      return res.status(400).json({ error: '請傳 confirm: "DELETE" 以確認刪除（刪除後該世界所有內容將永久刪除，無法復原）' });
+    }
+    const bindings = await getBindings(db, userId);
+    const binding = bindings.find(b => b.worldId === worldId);
+    if (!binding) {
+      return res.status(404).json({ error: '您尚未加入此世界' });
+    }
+    if (binding.role !== 'owner') {
+      return res.status(403).json({ error: '僅世界擁有者（老闆）可以刪除世界' });
+    }
+    await deleteWorldPermanently(db, worldId);
+    const currentWorldId = await getCurrentWorld(db, userId);
+    if (currentWorldId === worldId) {
+      await new Promise((resolve, reject) => {
+        db.run('DELETE FROM user_current_world WHERE userId = ?', [userId], (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    }
+    res.json({ success: true, message: '已刪除世界，該世界所有內容已永久移除。' });
+  } catch (err) {
+    console.error('❌ 刪除世界失敗:', err);
+    res.status(500).json({ error: '刪除世界時發生錯誤，請稍後再試' });
   }
 });
 

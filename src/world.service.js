@@ -155,6 +155,33 @@ export function deleteWorld(db, worldId) {
 }
 
 /**
+ * 永久刪除世界及其所有相關資料（訂單、歷史、綁定、當前世界、菜單圖片、世界本身）。
+ * 僅供世界擁有者（老闆）使用，刪除後無法復原。
+ * @returns {Promise<void>}
+ */
+export function deleteWorldPermanently(db, worldId) {
+  return new Promise((resolve, reject) => {
+    const run = (sql, params = []) =>
+      new Promise((res, rej) => {
+        db.run(sql, params, function (err) {
+          if (err) rej(err);
+          else res();
+        });
+      });
+    (async () => {
+      await run('DELETE FROM orders WHERE worldId = ?', [worldId]);
+      await run('DELETE FROM order_history WHERE worldId = ?', [worldId]);
+      await run('DELETE FROM menu_item_images WHERE worldId = ?', [worldId]).catch(() => {});
+      await run('DELETE FROM user_world_bindings WHERE worldId = ?', [worldId]);
+      await run('DELETE FROM user_current_world WHERE currentWorldId = ?', [worldId]);
+      await run('DELETE FROM worlds WHERE id = ?', [worldId]);
+    })()
+      .then(resolve)
+      .catch(reject);
+  });
+}
+
+/**
  * 更新世界名稱
  */
 export function updateWorldName(db, worldId, name) {

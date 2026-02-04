@@ -78,12 +78,15 @@ export function resolveVendorForItemName(orderItemName, worldVendorMap) {
  */
 export function validateVendorMapFormat(text) {
   try {
-    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+    // 保留縮排以區分廠商行（不縮排）與品項行（縮排或 - 開頭）
+    const lines = text.split('\n').filter((l) => l.trim() !== '');
     const config = {};
     let currentBranch = null;
     for (const line of lines) {
-      if (!line.startsWith(' ') && !line.startsWith('\t') && !line.startsWith('-')) {
-        currentBranch = line.replace(/:\s*$/, '');
+      const isVendorLine = !line.startsWith(' ') && !line.startsWith('\t') && !line.startsWith('-');
+      if (isVendorLine) {
+        currentBranch = line.trim().replace(/:\s*$/, '');
+        if (!currentBranch) return null;
         if (!config[currentBranch]) config[currentBranch] = {};
       } else {
         if (!currentBranch) return null;

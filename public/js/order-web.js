@@ -45,7 +45,7 @@ const state = {
   selectedItems: [], // [{ name: string, qty: number, attributes: string[] }]
   vendorItemMap: {}, // { itemName: vendor } 用於訂單建立時判斷廠商
   purchaserName: '', // 訂購人姓名（輸入）
-  currentStep: 'select_items', // 'select_items' | 'confirm' | 'complete'
+  currentStep: 'select_items', // 'select_items' | 'select_attr'（手機整頁選屬性）| 'confirm' | 'complete'
   
   // 多世界／訂單 切換
   view: 'order', // 'worlds' | 'order' | 'create_or_join_world' | 'join_world' | 'create_world' | 'my_orders' | 'members' | 'menu_manage' | 'help'
@@ -85,7 +85,7 @@ const state = {
   isLoading: false,
   errorMessage: null,
 
-  // 世界管理：退出世界模式
+  // 世界管理：刪除/退出世界模式（老闆=刪除世界，消費者=退出世界）
   leaveWorldMode: false,
 
   // 訂單詳情（編輯/取消/恢復）
@@ -98,7 +98,8 @@ const state = {
   orderDetailPendingQty: {},        // { [itemId]: qty } 暫存的數量變更
   orderDetailPendingDeletes: [],    // [itemId] 暫存的刪除
   orderDetailPendingAdds: [],       // [{ name, qty, tempId }] 暫存的新增
-  orderDetailAddCounter: 0          // 新增品項的遞增 id
+  orderDetailAddCounter: 0,         // 新增品項的遞增 id
+  attrModalItemId: null             // 手機版：點品項彈出屬性時，該品項 id
 };
 
 // ==================== API 封裝 ====================
@@ -614,11 +615,14 @@ function render() {
   const container = document.getElementById('app');
   if (!container) return;
   
-  // 切換到非登入頁時才清除錯誤，避免登入頁錯誤被洗掉；加入/創造世界流程的錯誤由各頁自行清除
+  // 僅在「切換 view」時清除錯誤，同頁重繪（如 goToConfirm 驗證失敗）保留錯誤，避免禁止彈出視窗時無提示
   const canClearError = state.userStatus !== 'not_logged_in' &&
     !['join_world', 'create_world'].includes(state.view);
-  if (canClearError) state.errorMessage = null;
-  
+  if (canClearError && state._lastRenderedView !== undefined && state._lastRenderedView !== state.view) {
+    state.errorMessage = null;
+  }
+  state._lastRenderedView = state.view;
+
   switch (state.userStatus) {
     case 'not_logged_in':
       renderLoginPage(container);
@@ -692,14 +696,17 @@ function renderWorldsPage(container) {
             const id = escapeJsAttr(String(w.id));
             const name = escapeJsAttr(w.name);
             const label = escapeHtml(w.name);
+            const isOwner = w.role === 'owner';
             if (state.leaveWorldMode) {
+              const actionLabel = isOwner ? '刪除' : '退出';
+              const actionFn = isOwner ? 'deleteWorld' : 'leaveWorld';
               return `
                 <div class="world-card world-card-leave" style="position: relative; padding-left: 2.5rem;">
                   <button type="button"
                           class="world-card-leave-btn"
                           style="position:absolute; left:0.5rem; top:50%; transform:translateY(-50%); background:#f44336; color:#fff; border:none; border-radius:999px; width:1.75rem; height:1.75rem; cursor:pointer;"
-                          onclick="orderWeb.leaveWorld('${id}', '${name}')">×</button>
-                  <span>${label}</span>
+                          onclick="orderWeb.${actionFn}('${id}', '${name}')" title="${isOwner ? '刪除世界（永久刪除所有內容）' : '退出世界'}">×</button>
+                  <span>${label}${isOwner ? ' <small>(老闆)</small>' : ''}</span>
                 </div>
               `;
             }
@@ -710,7 +717,7 @@ function renderWorldsPage(container) {
           <div class="world-card world-card-action" onclick="orderWeb.goCreateOrJoinWorld()">加入/創造世界</div>
           ${hasWorlds ? `
           <div class="world-card world-card-action" onclick="orderWeb.toggleLeaveWorldMode()">
-            ${state.leaveWorldMode ? '完成退出' : '退出世界'}
+            ${state.leaveWorldMode ? '完成' : '刪除/退出世界'}
           </div>
           ` : ''}
         </div>
@@ -883,6 +890,65 @@ async function leaveWorld(id, name) {
   }
 }
 
+/**
+ * 老闆刪除世界（永久刪除該世界所有內容，需二次確認）
+ */
+async function deleteWorld(id, name) {
+  if (!state.userId) {
+    showError('使用者未登入');
+    return;
+  }
+  const worldId = parseInt(id, 10);
+  if (isNaN(worldId)) {
+    showError('世界 ID 格式錯誤');
+    return;
+  }
+  const msg = '刪除後該世界所有內容將永久刪除，無法復原。\n包含：訂單、訂單歷史、菜單、成員、設定等。\n\n確定要刪除世界「' + name + '」嗎？';
+  if (!confirm(msg)) {
+    return;
+  }
+  setLoading(true);
+  state.errorMessage = null;
+  try {
+    const response = await fetch(`${API_BASE}/worlds/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: state.userId,
+        worldId,
+        confirm: 'DELETE'
+      })
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data || !data.success) {
+      const errMsg = (data && data.error) || '刪除世界失敗，請稍後再試';
+      throw new Error(errMsg);
+    }
+    await fetchWorlds(state.userId);
+    if (state.currentWorldId === worldId) {
+      state.currentWorldId = null;
+      state.currentWorldName = '當前 世界名稱';
+      state.currentWorldCode = null;
+      state.menu = null;
+      state.menuImageUrl = null;
+      state.formatted = null;
+      state.orderFormat = null;
+      state.selectedItems = [];
+      state.vendorItemMap = {};
+      state.view = 'worlds';
+    }
+    const hasWorlds = state.worlds && state.worlds.length > 0;
+    if (!hasWorlds) state.leaveWorldMode = false;
+    setLoading(false);
+    render();
+  } catch (error) {
+    console.error('❌ 刪除世界失敗:', error);
+    setLoading(false);
+    showError(error.message || '刪除世界失敗，請稍後再試');
+    render();
+  }
+}
+
 /** 底部導覽 HTML（操作流程指南 / 世界 / 我） */
 function navBottom() {
   const isCreatingWorld = ['create_world', 'setup_order_format', 'setup_boss_format'].includes(state.view);
@@ -970,6 +1036,15 @@ function renderOrderPage(container) {
   switch (state.currentStep) {
     case 'select_items':
       renderItemSelection(container);
+      break;
+    case 'select_attr':
+      if (isMobileView() && state.attrModalItemId) {
+        renderOrderAttrFullPage(container);
+      } else {
+        state.currentStep = 'select_items';
+        state.attrModalItemId = null;
+        renderItemSelection(container);
+      }
       break;
     case 'confirm':
       renderConfirmOrder(container);
@@ -1062,6 +1137,11 @@ function getAttributeDimensionsAndOptions(itemName) {
     return optionsByIndex[i] ? Array.from(optionsByIndex[i]).sort() : [];
   });
   return { dimensionNames, optionsPerDimension };
+}
+
+/** 手機版判定：與 CSS 斷點一致，僅手機版時屬性收進品項、點擊彈出 */
+function isMobileView() {
+  return typeof window !== 'undefined' && window.matchMedia('(max-width: 639px)').matches;
 }
 
 /** 依 owner 設定的 orderFormat 顯示屬性（requiredFields） */
@@ -1230,11 +1310,12 @@ function renderItemSelection(container) {
         <button type="button" class="btn-back" onclick="orderWeb.goBack()">← 返回</button>
         <div class="label-block">訂購品項</div>
       </div>
+      <div id="order-page-error" class="order-page-error" role="alert" style="${state.errorMessage ? '' : 'display:none'}">${state.errorMessage ? escapeHtml(state.errorMessage) : ''}</div>
       <!-- 簡化流程：直接顯示品項列表，不依賴 orderFormat -->
       <div class="order-rows ${(state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) || (state.itemAttributeOptions && Object.keys(state.itemAttributeOptions).length > 0) ? 'order-rows-with-attr' : ''}">
         <div class="order-row order-rows-head">
           <div class="label-block">品項</div>
-          ${(state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) || (state.itemAttributeOptions && Object.keys(state.itemAttributeOptions).length > 0) ? '<div class="label-block">屬性</div>' : ''}
+          ${(state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) || (state.itemAttributeOptions && Object.keys(state.itemAttributeOptions).length > 0) ? '<div class="label-block order-rows-head-attr">屬性</div>' : ''}
           <div class="label-block">數量</div>
         </div>
         ${(() => {
@@ -1333,7 +1414,11 @@ function renderItemSelection(container) {
             const attrs = (selectedItem.attributes || []);
             const { dimensionNames, optionsPerDimension } = getAttributeDimensionsAndOptions(itemName);
             const useDropdowns = dimensionNames.length > 0 && optionsPerDimension.some(opts => opts.length > 0);
-            const attrCell = hasAttr ? (useDropdowns ? `
+            const attrsFilled = dimensionNames.length > 0
+              ? (attrs.length >= dimensionNames.length && dimensionNames.every((_, i) => (attrs[i] || '').trim() !== ''))
+              : (attrs.length > 0 && (attrs[0] || '').trim() !== '');
+            const mobile = isMobileView();
+            const attrCellDesktop = hasAttr ? (useDropdowns ? `
                 <div class="order-attr-cell order-attr-dropdowns">
                   ${dimensionNames.map((dimName, di) => {
                     const options = optionsPerDimension[di] || [];
@@ -1350,37 +1435,50 @@ function renderItemSelection(container) {
                   <button type="button" class="btn-attr-plus" onclick="orderWeb.addItemAttribute('${safeId}')" title="新增屬性">＋</button>
                 </div>
               `) : (((state.menuItemAttributes && Object.keys(state.menuItemAttributes).length > 0) || (state.itemAttributeOptions && Object.keys(state.itemAttributeOptions).length > 0)) ? '<div class="order-attr-cell">－</div>' : '');
-            
-            return `
-              <div class="order-row">
-                <div class="label-block" style="flex:1; display:flex; align-items:center; gap:var(--spacing-sm);">
-                  <button 
-                    type="button" 
-                    class="btn-add-variant" 
-                    onclick="orderWeb.duplicateItemWithAttributes('${safeId}', '${safe}')" 
-                    style="width: 32px; height: 32px; border: 1px solid var(--color-primary); border-radius: 4px; background: var(--color-primary); color: white; font-size: 1.2rem; font-weight: bold; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0;"
-                    title="新增相同商品但不同屬性"
-                  >
-                    +
-                  </button>
+            const nameBlockInner = `
                   ${itemImageUrl ? `
                     <img src="${escapeHtml(itemImageUrl)}" alt="${escapeHtml(itemName)}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 4px; border: 1px solid var(--color-border); flex-shrink: 0;">
                   ` : ''}
                   <div style="flex: 1; min-width: 0;">
                     <div style="font-weight: 500;">${escapeHtml(itemName || '未命名品項')}</div>
+                    ${attrsFilled && mobile && hasAttr ? `<div class="order-row-attr-subtitle">${attrs.map(a => escapeHtml(a)).join('、')}</div>` : ''}
                     ${menuInfo ? `
                       <div style="font-size: 0.75rem; color: var(--color-text-light); margin-top: 0.25rem;">
                         ${escapeHtml(menuInfo.vendor)} | 庫存: ${menuInfo.stock}
                       </div>
                     ` : ''}
                   </div>
-                </div>
-                ${attrCell}
+            `;
+            const variantBtn = `
+                  <button type="button" class="btn-add-variant" onclick="${mobile && hasAttr ? 'event.stopPropagation(); ' : ''}orderWeb.duplicateItemWithAttributes('${safeId}', '${safe}')" style="width: 32px; height: 32px; border: 1px solid var(--color-primary); border-radius: 4px; background: var(--color-primary); color: white; font-size: 1.2rem; font-weight: bold; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0;" title="新增相同商品但不同屬性">+</button>
+            `;
+            const qtyBlock = `
                 <div class="btn-qty-wrap">
                   <button type="button" class="btn-qty" onclick="orderWeb.adjustItemQty('${safeId}', -1)" ${currentQty === 0 ? 'disabled' : ''}>−</button>
                   <input type="number" class="order-qty-input" min="0" value="${currentQty}" onchange="orderWeb.setItemQtyFromInput('${safeId}', this)">
                   <button type="button" class="btn-qty" onclick="orderWeb.adjustItemQty('${safeId}', 1)">＋</button>
                 </div>
+            `;
+            if (mobile) {
+              const nameBlockAttrs = mobile && hasAttr ? ` class="label-block order-row-name-tappable" style="flex:1; display:flex; align-items:center; gap:var(--spacing-sm); cursor:pointer;" onclick="orderWeb.openAttrModal('${safeId}')" role="button" tabindex="0"` : ` class="label-block" style="flex:1; display:flex; align-items:center; gap:var(--spacing-sm);"`;
+              return `
+              <div class="order-row ${mobile ? 'order-row-mobile' : ''}">
+                <div${nameBlockAttrs}>
+                  ${variantBtn}
+                  ${nameBlockInner}
+                </div>
+                ${qtyBlock}
+              </div>
+            `;
+            }
+            return `
+              <div class="order-row">
+                <div class="label-block" style="flex:1; display:flex; align-items:center; gap:var(--spacing-sm);">
+                  ${variantBtn}
+                  ${nameBlockInner}
+                </div>
+                ${attrCellDesktop}
+                ${qtyBlock}
               </div>
             `;
           }).join('');
@@ -1388,6 +1486,94 @@ function renderItemSelection(container) {
       </div>
       <div class="order-confirm-wrap">
         <button type="button" class="btn-block" onclick="orderWeb.goToConfirm()" ${state.selectedItems.filter(item => item.qty > 0).length === 0 ? 'disabled' : ''}>確認訂單</button>
+      </div>
+    </div>
+    ${navBottom()}
+  `;
+}
+
+/** 回傳品項的屬性表單欄位 HTML（供彈窗與手機整頁共用） */
+function getOrderAttrFormRowsHtml(itemId) {
+  const idx = state.selectedItems.findIndex(item => item.id === itemId);
+  if (idx < 0) return { itemName: '', rowsHtml: '' };
+  const item = state.selectedItems[idx];
+  const itemName = item.name;
+  const attrs = item.attributes || [];
+  const { dimensionNames, optionsPerDimension } = getAttributeDimensionsAndOptions(itemName);
+  const dims = dimensionNames.length > 0 ? dimensionNames : ['屬性'];
+  const optsPerDim = dimensionNames.length > 0 ? optionsPerDimension : [attrs.length ? [attrs[0]] : []];
+  const rows = dims.map((dimName, di) => {
+    const options = optsPerDim[di] || [];
+    const currentVal = attrs[di] || '';
+    if (options.length > 0) {
+      return `<label class="attr-modal-label">${escapeHtml(dimName)}</label>
+        <select class="attr-modal-select" data-attr-index="${di}">
+          <option value="">-- ${escapeHtml(dimName)} --</option>
+          ${options.map(v => `<option value="${escapeHtml(v)}" ${currentVal === v ? 'selected' : ''}>${escapeHtml(v)}</option>`).join('')}
+        </select>`;
+    }
+    return `<label class="attr-modal-label">${escapeHtml(dimName)}</label>
+      <input type="text" class="attr-modal-input" data-attr-index="${di}" placeholder="${escapeHtml(dimName)}" value="${escapeHtml(currentVal)}">`;
+  });
+  return { itemName, rowsHtml: rows.join('') };
+}
+
+/** 手機版：產生「選擇屬性」彈窗 HTML（桌面用 portal） */
+function renderOrderAttrModal(itemId) {
+  const { itemName, rowsHtml } = getOrderAttrFormRowsHtml(itemId);
+  if (!itemName && !rowsHtml) return '';
+  const safeId = escapeHtml(itemId).replace(/'/g, '&#39;');
+  return `<div class="dialog-overlay order-attr-modal-overlay" id="order-attr-modal" data-item-id="${safeId}" onclick="if(event.target===this) orderWeb.closeAttrModal()">
+    <div class="dialog-content order-attr-modal-content" onclick="event.stopPropagation()">
+      <div class="order-attr-modal-header">
+        <span class="order-attr-modal-title">${escapeHtml(itemName)}</span>
+        <button type="button" class="dialog-close order-attr-modal-close" onclick="orderWeb.closeAttrModal()" aria-label="關閉">×</button>
+      </div>
+      <div class="order-attr-modal-body">
+        ${rowsHtml}
+      </div>
+      <div class="order-attr-modal-footer">
+        <button type="button" class="btn-block btn-attr-modal-cancel" onclick="orderWeb.closeAttrModal()">取消</button>
+        <button type="button" class="btn-block btn-attr-modal-confirm" onclick="orderWeb.confirmAttrModal()">確認</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+/** 手機版：整頁「選擇屬性」（避免禁止彈出視窗導致亂碼） */
+function renderOrderAttrFullPage(container) {
+  const itemId = state.attrModalItemId;
+  if (!itemId) {
+    state.currentStep = 'select_items';
+    renderItemSelection(container);
+    return;
+  }
+  const { itemName, rowsHtml } = getOrderAttrFormRowsHtml(itemId);
+  if (!itemName && !rowsHtml) {
+    state.currentStep = 'select_items';
+    state.attrModalItemId = null;
+    renderItemSelection(container);
+    return;
+  }
+  container.innerHTML = `
+    <div class="page-order">
+      <div class="order-header">
+        <span class="order-title">訂單頁面</span>
+        ${orderHeaderLinks()}
+      </div>
+      <div class="step-header">
+        <button type="button" class="btn-back" onclick="orderWeb.closeAttrModal()">← 返回</button>
+        <div class="label-block">選擇屬性</div>
+      </div>
+      <div class="order-attr-fullpage">
+        <div class="order-attr-fullpage-title">${escapeHtml(itemName)}</div>
+        <div id="order-attr-form" class="order-attr-fullpage-body">
+          ${rowsHtml}
+        </div>
+        <div class="order-attr-fullpage-footer">
+          <button type="button" class="btn-block btn-attr-modal-cancel" onclick="orderWeb.closeAttrModal()">取消</button>
+          <button type="button" class="btn-block btn-attr-modal-confirm" onclick="orderWeb.confirmAttrModal()">確認</button>
+        </div>
       </div>
     </div>
     ${navBottom()}
@@ -1580,7 +1766,11 @@ function adjustItemQty(itemIdOrName, change) {
  * 返回上一步
  */
 function goBack() {
-  if (state.currentStep === 'select_items') {
+  if (state.currentStep === 'select_attr') {
+    state.currentStep = 'select_items';
+    state.attrModalItemId = null;
+    render();
+  } else if (state.currentStep === 'select_items') {
     state.view = 'worlds';
     render();
   } else if (state.currentStep === 'confirm') {
@@ -1590,31 +1780,49 @@ function goBack() {
 }
 
 /**
- * 前往確認頁
+ * 前往確認頁（未填屬性時列出全部、只更新錯誤區塊不整頁重繪，避免閃爍與捲動到頂端）
  */
 function goToConfirm() {
   const validItems = state.selectedItems.filter(item => item.qty > 0);
   if (validItems.length === 0) {
-    showError('請至少選擇一個品項');
+    state.errorMessage = '請至少選擇一個品項';
+    updateOrderPageErrorOnly(state.errorMessage);
     return;
   }
-  // 有屬性的品項必須選完屬性才能確認
+  const missing = [];
   for (const item of validItems) {
     const { dimensionNames, optionsPerDimension } = getAttributeDimensionsAndOptions(item.name);
     const requiredCount = optionsPerDimension.filter(opts => opts && opts.length > 0).length;
     if (requiredCount === 0) continue;
     const attrs = item.attributes || [];
+    const missingDims = [];
     for (let i = 0; i < requiredCount; i++) {
       const val = (attrs[i] != null ? String(attrs[i]) : '').trim();
-      if (!val) {
-        const dimName = dimensionNames[i] || ('屬性' + (i + 1));
-        showError(`請為「${item.name}」選擇${dimName}後再確認訂單`);
-        return;
-      }
+      if (!val) missingDims.push(dimensionNames[i] || ('屬性' + (i + 1)));
     }
+    if (missingDims.length > 0) missing.push({ name: item.name, dims: missingDims });
   }
+  if (missing.length > 0) {
+    const lines = missing.map(m => `• ${m.name}（${m.dims.join('、')}）`);
+    state.errorMessage = '請先選擇屬性後再確認訂單：\n' + lines.join('\n');
+    updateOrderPageErrorOnly(state.errorMessage);
+    return;
+  }
+  state.errorMessage = null;
   state.currentStep = 'confirm';
   render();
+}
+
+/** 只更新訂單頁錯誤區塊，不整頁重繪（避免閃爍）；有錯誤時捲動到頂端 */
+function updateOrderPageErrorOnly(message) {
+  const el = document.getElementById('order-page-error');
+  if (el) {
+    el.innerHTML = message ? escapeHtml(message).replace(/\n/g, '<br>') : '';
+    el.style.display = message ? 'block' : 'none';
+    if (message) window.scrollTo(0, 0);
+  } else {
+    render();
+  }
 }
 
 /**
@@ -1723,6 +1931,76 @@ function addItemAttribute(itemIdOrName) {
     }
     render();
   }
+}
+
+const ORDER_ATTR_MODAL_ROOT_ID = 'order-attr-modal-root';
+
+function getOrderAttrModalRoot() {
+  let root = document.getElementById(ORDER_ATTR_MODAL_ROOT_ID);
+  if (!root) {
+    root = document.createElement('div');
+    root.id = ORDER_ATTR_MODAL_ROOT_ID;
+    document.body.appendChild(root);
+  }
+  return root;
+}
+
+/** 手機版：開啟屬性（手機用整頁、桌面用 portal） */
+function openAttrModal(itemId) {
+  state.errorMessage = null;
+  updateOrderPageErrorOnly(null);
+  state.attrModalItemId = itemId;
+  if (isMobileView()) {
+    state.currentStep = 'select_attr';
+    render();
+    return;
+  }
+  const root = getOrderAttrModalRoot();
+  root.innerHTML = renderOrderAttrModal(itemId);
+}
+
+/** 手機版：關閉屬性（整頁返回列表 or 關閉 portal） */
+function closeAttrModal() {
+  if (state.currentStep === 'select_attr') {
+    state.currentStep = 'select_items';
+    state.attrModalItemId = null;
+    render();
+    return;
+  }
+  state.attrModalItemId = null;
+  const root = document.getElementById(ORDER_ATTR_MODAL_ROOT_ID);
+  if (root) root.innerHTML = '';
+}
+
+/** 手機版：確認屬性並寫回品項（表單可能在 portal #order-attr-modal 或整頁 #order-attr-form） */
+function confirmAttrModal() {
+  const itemId = state.attrModalItemId;
+  if (!itemId) return;
+  const idx = state.selectedItems.findIndex(item => item.id === itemId);
+  if (idx < 0) return;
+  const container = document.getElementById('order-attr-modal') || document.getElementById('order-attr-form');
+  if (!container) return;
+  const selects = container.querySelectorAll('.attr-modal-select');
+  const inputs = container.querySelectorAll('.attr-modal-input');
+  const maxIndex = Math.max(
+    ...Array.from(selects).map(el => parseInt(el.getAttribute('data-attr-index'), 10)),
+    ...Array.from(inputs).map(el => parseInt(el.getAttribute('data-attr-index'), 10)),
+    -1
+  );
+  const attributes = [];
+  for (let i = 0; i <= maxIndex; i++) {
+    const sel = container.querySelector(`.attr-modal-select[data-attr-index="${i}"]`);
+    const inp = container.querySelector(`.attr-modal-input[data-attr-index="${i}"]`);
+    if (sel) attributes.push((sel.value || '').trim());
+    else if (inp) attributes.push((inp.value || '').trim());
+    else attributes.push('');
+  }
+  state.selectedItems[idx].attributes = attributes;
+  state.attrModalItemId = null;
+  state.currentStep = 'select_items';
+  const root = document.getElementById(ORDER_ATTR_MODAL_ROOT_ID);
+  if (root) root.innerHTML = '';
+  render();
 }
 
 /**
@@ -2082,10 +2360,7 @@ function setLoading(loading) {
  */
 function showError(message) {
   state.errorMessage = message;
-  // 可以顯示 toast 或 alert
-  if (message) {
-    alert(message); // 暫時用 alert，之後可改為 toast
-  }
+  // 不依賴 alert，改為頁面顯示錯誤，避免「禁止彈出視窗」時完全無提示
 }
 
 // ==================== 初始化 ====================
@@ -5143,6 +5418,9 @@ window.orderWeb = {
   toggleItemAttribute,
   setItemAttributeValue,
   setItemAttributeFromSelect,
+  openAttrModal,
+  closeAttrModal,
+  confirmAttrModal,
   duplicateItemWithAttributes,
   goBack,
   goToConfirm,
@@ -5177,6 +5455,7 @@ window.orderWeb = {
   selectWorld,
   toggleLeaveWorldMode,
   leaveWorld,
+  deleteWorld,
   setMyOrdersDate,
   setMyOrdersWorld,
   handleDateTypeChange,
@@ -5221,3 +5500,17 @@ if (document.readyState === 'loading') {
 } else {
   init();
 }
+
+// 手機版：僅在「跨過 639px 斷點」時重繪，避免手機位址列/鍵盤/捲動觸發 resize 造成閃爍
+let _resizeTimer = null;
+let _lastMobile = isMobileView();
+window.addEventListener('resize', () => {
+  if (_resizeTimer) clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(() => {
+    const nowMobile = isMobileView();
+    if (nowMobile !== _lastMobile) {
+      _lastMobile = nowMobile;
+      if (state.view === 'order' && state.currentStep === 'select_items') render();
+    }
+  }, 200);
+});

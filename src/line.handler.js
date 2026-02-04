@@ -167,20 +167,21 @@ export function parseMessage(text) {
     if (lines.length < 2) return null;
     return { type: 'BOSS_QUERY', date: lines[1] };
   }
+  // 查詢：查詢 + 日期（無分店，兩行即可）
   if (first === '查詢') {
-    if (lines.length < 3) return null;
-    return { type: 'QUERY', date: lines[1], branch: lines[2] };
+    if (lines.length < 2) return null;
+    return { type: 'QUERY', date: lines[1], branch: '' };
   }
-  if (lines.length < 2) return null;
-  const branch = lines[0].trim();
-  if (!branch || branch.length === 0 || branch.length > 100) return null;
+  // 建立訂單：每行「品項名稱 數量」，最後一行可為日期（無分店，branch 存空字串）
+  if (lines.length < 1) return null;
   const items = [];
   let timeStr = null;
-  for (let i = 1; i < lines.length; i++) {
+  for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const timeMatch = line.match(/^(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}:\d{2})/);
-    if (timeMatch && i === lines.length - 1) {
-      timeStr = line;
+    const timeMatch = line.match(/^(\d{4}[-/]\d{1,2}[-/]\d{1,2})(?:\s|$)/);
+    const isLastLine = i === lines.length - 1;
+    if (timeMatch && isLastLine && items.length > 0) {
+      timeStr = timeMatch[1];
       break;
     }
     const m = line.match(/^(.+?)\s+(\d+)$/);
@@ -193,7 +194,7 @@ export function parseMessage(text) {
     }
   }
   if (items.length === 0) return null;
-  return { type: 'CREATE', branch, items, time: timeStr };
+  return { type: 'CREATE', branch: '', items, time: timeStr };
 }
 
 export function parseUserIntent(text) {
@@ -229,9 +230,22 @@ export function parseWorldCommand(text) {
     return { type: 'VIEW_CURRENT_WORLD' };
   }
   
-  // 退出世界
-  if (t === '退出世界' || t === '離開世界' || t === '退出店家' || t === '離開店家' || t.startsWith('退出世界') || t.startsWith('離開世界')) {
+  // 刪除/退出世界（老闆=刪除世界，消費者=退出世界）
+  if (t === '退出世界' || t === '離開世界' || t === '退出店家' || t === '離開店家' ||
+      t === '刪除世界' || t.startsWith('退出世界') || t.startsWith('離開世界') || t.startsWith('刪除世界')) {
     return { type: 'LEAVE_WORLD_PROMPT' };
+  }
+  
+  // 確認刪除世界 [ID 或代碼]（僅老闆，二次確認用）
+  const confirmDeleteMatch = t.match(/^確認刪除世界[\s:：]+(.+)$/);
+  if (confirmDeleteMatch) {
+    const arg = confirmDeleteMatch[1].trim();
+    const num = arg.match(/^#?\s*(\d+)\s*[.\s]*$/);
+    if (num) {
+      const id = parseInt(num[1], 10);
+      if (id > 0) return { type: 'CONFIRM_DELETE_WORLD', worldId: id };
+    }
+    if (arg.length >= 6) return { type: 'CONFIRM_DELETE_WORLD', worldCode: arg.toUpperCase() };
   }
   
   // 切換世界的世界 ID 輸入
@@ -249,8 +263,8 @@ export function parseWorldCommand(text) {
     }
   }
   
-  // 退出世界的世界 ID 輸入
-  const leaveMatch = t.match(/^(?:退出世界|離開世界|退出店家|離開店家)[\s:：]*(.+)$/);
+  // 刪除世界/退出世界的世界 ID 輸入
+  const leaveMatch = t.match(/^(?:退出世界|離開世界|退出店家|離開店家|刪除世界)[\s:：]*(.+)$/);
   if (leaveMatch) {
     const worldIdStr = leaveMatch[1].trim();
     const num = worldIdStr.match(/^#?(\d+)$/);
@@ -265,14 +279,16 @@ export function parseWorldCommand(text) {
   }
   
   // 直接輸入世界 ID 或 worldCode（在已有綁定的情況下，視為切換世界）
-  const directNum = t.match(/^#?(\d+)$/);
+  // 接受純數字、#數字、或數字後帶 . / 空格（例如 1. 或 1 ）
+  const directNum = t.match(/^#?\s*(\d+)\s*[.\s]*$/);
   if (directNum) {
     const id = parseInt(directNum[1], 10);
     if (id > 0) return { type: 'SWITCH_WORLD', worldId: id };
   }
-  // 8 位大寫字母數字組合，視為 worldCode
-  if (/^[A-Z0-9]{8}$/.test(t.toUpperCase())) {
-    return { type: 'SWITCH_WORLD', worldCode: t.toUpperCase() };
+  // 8 位字母數字組合，視為 worldCode（接受大小寫，尾端允許空白）
+  const codeMatch = t.trim().match(/^([A-Z0-9]{8})\s*$/i);
+  if (codeMatch) {
+    return { type: 'SWITCH_WORLD', worldCode: codeMatch[1].toUpperCase() };
   }
   
   return null;
@@ -332,6 +348,16 @@ export function parseMenuCommand(text) {
   if (lines.length === 0) return null;
   
   const first = lines[0].trim();
+  // 菜單格式說明（僅第一行為指令時）
+  if (first === '菜單格式' || first === '菜單格式說明') {
+    return { type: 'MENU_FORMAT_HELP' };
+  }
+
+  // 設定菜單（整份貼上）：第一行為「設定菜單」或「更新菜單」，後方可帶整份菜單
+  if (first === '設定菜單' || first === '更新菜單') {
+    const content = text.includes('\n') ? text.slice(text.indexOf('\n') + 1) : '';
+    return { type: 'SET_MENU_FULL', content };
+  }
   
   // 查看菜單
   if (first === '查看菜單' || first === '菜單' || first === '查看' || first === '看菜單') {
@@ -536,7 +562,18 @@ export async function handleLineEvent(db, event) {
         await flows.flowLeaveWorld(db, userId, worldCmd, replyToken, state, { reply });
         return;
       }
+      if (worldCmd.type === 'CONFIRM_DELETE_WORLD') {
+        await flows.flowConfirmDeleteWorld(db, userId, worldCmd, replyToken, state, { reply });
+        return;
+      }
     }
+  }
+
+  // 菜單格式說明（所有使用者，方便老闆與消費者查看）
+  const menuCmdForHelp = parseMenuCommand(text);
+  if (menuCmdForHelp && menuCmdForHelp.type === 'MENU_FORMAT_HELP') {
+    await flows.flowMenuFormatHelp(db, userId, replyToken, state, { reply });
+    return;
   }
 
   // 檢查是否為查看菜單指令（所有使用者）
@@ -544,6 +581,10 @@ export async function handleLineEvent(db, event) {
     const menuCmd = parseMenuCommand(text);
     if (menuCmd && menuCmd.type === 'VIEW_MENU') {
       await flows.flowViewMenu(db, userId, replyToken, state, { reply });
+      return;
+    }
+    if (menuCmd && menuCmd.type === 'SET_MENU_FULL') {
+      await flows.flowSetMenuFull(db, userId, menuCmd.content, replyToken, state, { reply });
       return;
     }
   }

@@ -19,6 +19,7 @@ import {
   updateWorldName,
   getBindings,
   deleteWorld,
+  deleteWorldPermanently,
   unbindUserFromWorld,
   updateOrderFormat,
   updateDisplayFormat,
@@ -147,8 +148,8 @@ UNIQLO
   T恤 藍 L 3
 
 💡 格式說明：
-• 第一行：廠商/店家名稱
-• 後續行：品項名稱 數量（用空格分隔）
+• 第一行：廠商/類別名稱
+• 後續行：品項名稱 數量（需縮排，用空格分隔）
 • 品項名稱可包含屬性（如顏色、尺寸）
 • 數量必須是數字，放在最後
 
@@ -204,42 +205,34 @@ export async function flowVendorMapSetup(db, userId, text, replyToken, state, { 
         errorMsg += '您沒有輸入任何內容\n\n';
       } else if (lines.length === 1) {
         errorMsg += '格式不完整：只有一行內容\n\n';
-        errorMsg += '📋 正確格式：\n分店名稱\n  品項名稱 數量\n  品項名稱 數量\n\n';
+        errorMsg += '📋 正確格式：\n廠商名稱\n  品項名稱 數量\n  品項名稱 數量\n\n';
       } else {
-        // 檢查是否有分店名稱
-        const hasBranch = lines.some(line => !line.startsWith(' ') && !line.startsWith('\t') && !line.startsWith('-'));
-        if (!hasBranch) {
-          errorMsg += '缺少分店名稱（第一行應該是分店名稱）\n\n';
+        const hasVendor = lines.some(line => !line.startsWith(' ') && !line.startsWith('\t') && !line.startsWith('-'));
+        if (!hasVendor) {
+          errorMsg += '缺少廠商/類別名稱（第一行應為廠商名稱）\n\n';
         } else {
-          // 檢查品項格式
           let hasValidItem = false;
           for (let i = 1; i < lines.length; i++) {
             const line = lines[i];
-            if (line.startsWith('-')) {
-              hasValidItem = true;
-            } else if (line.match(/\s+\d+$/)) {
-              hasValidItem = true;
-            } else if (line.trim() && !line.startsWith(' ') && !line.startsWith('\t')) {
-              // 可能是新的分店名稱，但格式不對
-            }
+            if (line.startsWith('-')) hasValidItem = true;
+            else if (line.match(/\s+\d+$/)) hasValidItem = true;
           }
           if (!hasValidItem) {
-            errorMsg += '缺少品項資訊（分店名稱下方應該有品項列表）\n\n';
+            errorMsg += '缺少品項資訊（廠商名稱下方應有品項列表）\n\n';
           } else {
             errorMsg += '品項格式錯誤\n\n';
           }
         }
       }
-      
       errorMsg += '📋 正確格式範例：\n\n';
-      errorMsg += '範例 1（基本格式）：\n全聯\n  雞蛋 10\n  牛奶 5\n  吐司 3\n\n';
-      errorMsg += '範例 2（使用 - 符號，數量為 0）：\n全聯\n  - 雞蛋\n  - 牛奶\n  - 吐司\n\n';
-      errorMsg += '範例 3（多個分店）：\n全聯\n  雞蛋 10\n  牛奶 5\nUNIQLO\n  T恤 黑 M 10\n  T恤 白 S 5\n\n';
+      errorMsg += '範例 1（基本）：\n飲料\n  珍珠奶茶 10\n  紅茶 5\n  綠茶 3\n\n';
+      errorMsg += '範例 2（- 符號，數量 0）：\n飲料\n  - 珍珠奶茶\n  - 紅茶\n\n';
+      errorMsg += '範例 3（多廠商）：\n飲料\n  珍珠奶茶 10\n  紅茶 5\n便當\n  雞腿飯 20\n  排骨飯 15\n\n';
       errorMsg += '💡 格式說明：\n';
-      errorMsg += '• 第一行：分店名稱（不可縮排）\n';
-      errorMsg += '• 後續行：品項名稱 數量（需縮排，用空格分隔）\n';
+      errorMsg += '• 第一行：廠商/類別名稱（不可縮排）\n';
+      errorMsg += '• 後續行：品項名稱 數量（需縮排，空格分隔）\n';
       errorMsg += '• 或使用：- 品項名稱（數量為 0）\n';
-      errorMsg += '• 數量必須是正整數（1-999999）\n\n';
+      errorMsg += '• 數量為正整數（1-999999）\n\n';
       errorMsg += '請重新輸入正確格式（或輸入「重來」放棄建立）';
       
       await updateWorldStatus(db, ob.worldId, 'failed');
@@ -288,8 +281,8 @@ export async function flowHelp(db, userId, replyToken, state, { reply }) {
     ? `📋 可用指令（老闆）：
 
 🔹 訂單相關：
-• 記訂單：分店→換行→品項 數量
-• 查訂單：查詢 日期 分店
+• 記訂單：品項 數量（每行一筆）
+• 查訂單：查詢 日期
 • 修改訂單：修改 品項名稱 ±數量
 • 老闆查詢：老闆查詢 日期（查看所有訂單，按廠商分組）
 
@@ -297,7 +290,7 @@ export async function flowHelp(db, userId, replyToken, state, { reply }) {
 • 我的店家：查看所有已加入的世界
 • 當前店家：查看目前使用的世界
 • 切換世界：切換到其他世界
-• 退出世界：離開某個世界
+• 刪除/退出世界：老闆為刪除世界（需二次確認），消費者為退出世界
 • 清理訂單：清理（清除所有訂單）
 • 查看成員：查看成員（查看世界成員名單）
 • 剔除成員：剔除成員 [User ID]（移除世界成員）
@@ -307,23 +300,25 @@ export async function flowHelp(db, userId, replyToken, state, { reply }) {
 • 設定顯示格式：設定顯示格式（設定老闆查詢顯示格式）
 
 🔹 菜單管理：
+• 菜單格式：菜單格式（查看菜單格式說明）
+• 設定菜單：設定菜單後換行貼上整份菜單（覆蓋目前菜單）
 • 查看菜單：查看菜單
-• 新增品項：新增品項\\n分店\\n品項名稱 [數量]
-• 刪除品項：刪除品項\\n分店\\n品項名稱
-• 修改品項：修改品項\\n分店\\n品項名稱\\n新數量
+• 新增品項：新增品項\\n廠商\\n品項名稱 [數量]
+• 刪除品項：刪除品項\\n廠商\\n品項名稱
+• 修改品項：修改品項\\n廠商\\n舊品項\\n新品項 [數量]
 • 設定菜單圖片：設定菜單圖片\\n[圖片 URL]`
     : `📋 可用指令（員工）：
 
 🔹 訂單相關：
-• 記訂單：分店→換行→品項 數量
-• 查訂單：查詢 日期 分店
+• 記訂單：品項 數量（每行一筆）
+• 查訂單：查詢 日期
 • 修改訂單：修改 品項名稱 ±數量
 
 🔹 世界管理：
 • 我的店家：查看所有已加入的世界
 • 當前店家：查看目前使用的世界
 • 切換世界：切換到其他世界
-• 退出世界：離開某個世界
+• 退出世界：離開某個世界（消費者）
 
 🔹 其他：
 • 查看菜單：查看菜單`;
@@ -582,19 +577,27 @@ export async function flowRemoveMember(db, userId, memberCmd, replyToken, state,
 }
 
 /**
- * 查看菜單
+ * 查看菜單（依「當前世界」顯示，與切換世界一致）
  */
 export async function flowViewMenu(db, userId, replyToken, state, { reply }) {
   try {
-    const bindings = await getBindings(db, userId);
-    const activeBinding = bindings.find((b) => b.status === 'active');
-    if (!activeBinding) {
-      await reply(replyToken, '❌ 世界尚未啟用');
+    const currentWorldId = state.currentWorldId;
+    if (!currentWorldId) {
+      await reply(replyToken, '❌ 請先選擇世界\n\n輸入「切換世界」選擇要查看的世界');
       return;
     }
-    
-    const world = await getWorldById(db, activeBinding.worldId);
-    const vendorMap = await getVendorMap(db, activeBinding.worldId);
+    const bindings = await getBindings(db, userId);
+    const currentBinding = bindings.find((b) => b.worldId === currentWorldId);
+    if (!currentBinding) {
+      await reply(replyToken, '❌ 找不到當前世界\n\n請輸入「切換世界」重新選擇');
+      return;
+    }
+    if (currentBinding.status !== 'active') {
+      await reply(replyToken, '❌ 當前世界尚未啟用\n\n請等待老闆完成設定，或切換到其他世界');
+      return;
+    }
+    const world = await getWorldById(db, currentWorldId);
+    const vendorMap = await getVendorMap(db, currentWorldId);
     
     const messages = [];
     
@@ -643,7 +646,7 @@ export async function flowAddMenuItem(db, userId, menuCmd, replyToken, state, { 
     
     const success = await addItemToMenu(db, ob.worldId, menuCmd.branch, menuCmd.itemName, menuCmd.qty);
     if (success) {
-      await reply(replyToken, `✅ 已新增品項到菜單\n\n分店: ${menuCmd.branch}\n品項: ${menuCmd.itemName}\n數量: ${menuCmd.qty}`);
+      await reply(replyToken, `✅ 已新增品項到菜單\n\n廠商: ${menuCmd.branch}\n品項: ${menuCmd.itemName}\n數量: ${menuCmd.qty}`);
     } else {
       await reply(replyToken, '❌ 新增品項失敗');
     }
@@ -667,9 +670,9 @@ export async function flowRemoveMenuItem(db, userId, menuCmd, replyToken, state,
     
     const success = await removeItemFromMenu(db, ob.worldId, menuCmd.branch, menuCmd.itemName);
     if (success) {
-      await reply(replyToken, `✅ 已從菜單刪除品項\n\n分店: ${menuCmd.branch}\n品項: ${menuCmd.itemName}`);
+      await reply(replyToken, `✅ 已從菜單刪除品項\n\n廠商: ${menuCmd.branch}\n品項: ${menuCmd.itemName}`);
     } else {
-      await reply(replyToken, `❌ 找不到品項「${menuCmd.itemName}」\n\n請確認分店和品項名稱是否正確`);
+      await reply(replyToken, `❌ 找不到品項「${menuCmd.itemName}」\n\n請確認廠商和品項名稱是否正確`);
     }
   } catch (err) {
     console.error('❌ 刪除品項失敗:', err);
@@ -691,7 +694,7 @@ export async function flowUpdateMenuItem(db, userId, menuCmd, replyToken, state,
     
     const success = await updateMenuItem(db, ob.worldId, menuCmd.branch, menuCmd.oldItemName, menuCmd.newItemName, menuCmd.qty);
     if (success) {
-      let msg = `✅ 已修改菜單品項\n\n分店: ${menuCmd.branch}\n`;
+      let msg = `✅ 已修改菜單品項\n\n廠商: ${menuCmd.branch}\n`;
       if (menuCmd.newItemName !== menuCmd.oldItemName) {
         msg += `品項: ${menuCmd.oldItemName} → ${menuCmd.newItemName}\n`;
       }
@@ -700,11 +703,75 @@ export async function flowUpdateMenuItem(db, userId, menuCmd, replyToken, state,
       }
       await reply(replyToken, msg.trim());
     } else {
-      await reply(replyToken, `❌ 找不到品項「${menuCmd.oldItemName}」\n\n請確認分店和品項名稱是否正確`);
+      await reply(replyToken, `❌ 找不到品項「${menuCmd.oldItemName}」\n\n請確認廠商和品項名稱是否正確`);
     }
   } catch (err) {
     console.error('❌ 修改品項失敗:', err);
     await reply(replyToken, '❌ 修改品項時發生錯誤，請稍後再試');
+  }
+}
+
+/**
+ * 菜單格式說明（讓老闆知道如何填寫菜單）
+ */
+export async function flowMenuFormatHelp(db, userId, replyToken, state, { reply }) {
+  const msg =
+    '📋 菜單格式說明\n\n' +
+    '🔹 建立新世界時：在「請設定訂單格式」那一步，直接貼上整份菜單即可。\n\n' +
+    '🔹 已有世界要更新整份菜單：輸入「設定菜單」後換行，貼上整份菜單（會覆蓋目前菜單）。\n\n' +
+    '📝 格式規則：\n' +
+    '• 第一行：廠商/類別名稱（不可縮排）\n' +
+    '• 後續行：品項名稱 數量（需縮排一至兩格，品項與數量用空格分隔）\n' +
+    '• 或使用：- 品項名稱（數量為 0）\n' +
+    '• 數量為正整數（1-999999）\n\n' +
+    '📌 範例：\n' +
+    '飲料\n' +
+    '  珍珠奶茶 10\n' +
+    '  紅茶 5\n' +
+    '  綠茶 3\n' +
+    '便當\n' +
+    '  雞腿飯 20\n' +
+    '  排骨飯 15\n\n' +
+    '💡 多廠商時，每個廠商名稱佔一行（不縮排），底下為該廠商的品項列表。';
+  await reply(replyToken, msg);
+}
+
+/**
+ * 對已有世界一次貼上整份菜單（覆蓋目前菜單，僅老闆）
+ */
+export async function flowSetMenuFull(db, userId, content, replyToken, state, { reply }) {
+  try {
+    if (!state.currentWorldId) {
+      await reply(replyToken, '❌ 請先選擇世界\n\n輸入「切換世界」選擇要設定菜單的世界');
+      return;
+    }
+    const bindings = await getBindings(db, userId);
+    const ob = bindings.find((b) => b.worldId === state.currentWorldId && b.role === 'owner' && b.status === 'active');
+    if (!ob) {
+      await reply(replyToken, '❌ 僅世界擁有者可以設定菜單，且世界須已啟用');
+      return;
+    }
+    if (!content || !content.trim()) {
+      await reply(
+        replyToken,
+        '📋 設定菜單方式：請在同一則訊息中，第一行輸入「設定菜單」，換行後貼上整份菜單。\n\n輸入「菜單格式」可查看菜單格式說明。'
+      );
+      return;
+    }
+    const parsed = validateVendorMapFormat(content);
+    if (!parsed) {
+      await reply(
+        replyToken,
+        '❌ 菜單格式錯誤\n\n請輸入「菜單格式」查看格式說明。\n格式要點：第一行為廠商名稱，後續行縮排並寫「品項名稱 數量」。'
+      );
+      return;
+    }
+    await saveVendorMap(db, ob.worldId, parsed);
+    const totalItems = Object.values(parsed).reduce((sum, items) => sum + Object.keys(items).length, 0);
+    await reply(replyToken, `✅ 菜單已更新\n\n共 ${Object.keys(parsed).length} 個廠商/類別，${totalItems} 個品項。\n輸入「查看菜單」可確認內容。`);
+  } catch (err) {
+    console.error('❌ 設定菜單失敗:', err);
+    await reply(replyToken, '❌ 設定菜單時發生錯誤，請稍後再試');
   }
 }
 
@@ -881,7 +948,7 @@ export async function flowSetDisplayFormat(db, userId, text, replyToken, state, 
 
 可用變數：
 • {vendor}：廠商名稱
-• {branch}：分店名稱
+• {branch}：廠商/類別名稱
 • {item}：品項名稱
 • {qty}：數量
 • {users}：點單者列表（格式：(使用者A、使用者B)）
@@ -938,10 +1005,8 @@ export async function flowClear(db, userId, replyToken, state, { reply }) {
 
 export async function flowOrder(db, userId, parsed, replyToken, state, { reply }) {
   try {
-    // 取得使用者所屬的 active 世界 ID（如果有多個，使用第一個）
     const bindings = await getBindings(db, userId);
-    const activeBinding = bindings.find((b) => b.status === 'active');
-    const worldId = activeBinding ? activeBinding.worldId : null;
+    const worldId = state.currentWorldId || (bindings.find((b) => b.status === 'active')?.worldId ?? null);
     const worldIds = bindings.filter((b) => b.status === 'active').map((b) => b.worldId);
     
     // 取得世界的訂購格式規範（用於驗證）
@@ -997,12 +1062,10 @@ export async function flowOrder(db, userId, parsed, replyToken, state, { reply }
       
       const displayName = await getLineDisplayName(userId);
       const orderId = await createOrder(db, parsed.branch, parsed.items, displayName || 'LINE', worldId, userId);
-      console.log(`✅ 已存入 ${parsed.branch} 訂單，共 ${parsed.items.length} 項商品，訂單 ID: ${orderId}`);
-      let replyMsg = `✅ 訂單已建立\n訂單 ID: ${orderId}\n分店: ${parsed.branch}\n`;
+      console.log(`✅ 已存入訂單 worldId=${worldId}，共 ${parsed.items.length} 項，訂單 ID: ${orderId}`);
+      let replyMsg = `✅ 訂單已建立\n訂單 ID: ${orderId}\n`;
       parsed.items.forEach((item) => { replyMsg += `${item.name} x${item.qty}\n`; });
       await reply(replyToken, replyMsg.trim());
-      
-      // 通知 owner 有新訂單
       await notifyOwnerNewOrder(db, worldId, orderId, parsed.branch, parsed.items, displayName || 'LINE');
       // 通知消費者（下單者）訂單資訊
       await notifyConsumerNewOrder(db, worldId, orderId, parsed.items, userId, displayName || 'LINE');
@@ -1020,22 +1083,22 @@ export async function flowOrder(db, userId, parsed, replyToken, state, { reply }
         let replyMsg = `✅ 已修改 ${result.modified} 筆訂單\n品項: ${parsed.item}\n`;
         result.results.forEach((r) => {
           if (r.deleted) {
-            replyMsg += `訂單 ${r.orderId} (${r.branch}): 已刪除 (數量為 0)\n`;
+            replyMsg += `訂單 ${r.orderId}: 已刪除 (數量為 0)\n`;
           } else {
             const changeStr = parsed.type === 'MODIFY_SET'
               ? `設為 ${r.newQty}`
               : `${r.oldQty} → ${r.newQty} (${parsed.change > 0 ? '+' : ''}${parsed.change})`;
-            replyMsg += `訂單 ${r.orderId} (${r.branch}): ${changeStr}\n`;
+            replyMsg += `訂單 ${r.orderId}: ${changeStr}\n`;
           }
         });
         await reply(replyToken, replyMsg.trim());
       }
     } else if (parsed.type === 'QUERY') {
-      const results = await queryOrdersByDateAndBranch(db, parsed.date, parsed.branch);
+      const results = await queryOrdersByDateAndBranch(db, parsed.date, parsed.branch, worldId);
       if (results.length === 0) {
-        await reply(replyToken, `📋 查無訂單\n日期: ${parsed.date}\n分店: ${parsed.branch}`);
+        await reply(replyToken, `📋 查無訂單\n日期: ${parsed.date}`);
       } else {
-        let replyMsg = `📋 查詢結果 (共 ${results.length} 筆)\n日期: ${parsed.date}\n分店: ${parsed.branch}\n\n`;
+        let replyMsg = `📋 查詢結果 (共 ${results.length} 筆)\n日期: ${parsed.date}\n\n`;
         results.forEach((order, idx) => {
           replyMsg += `訂單 ${idx + 1} (ID: ${order.orderId})\n`;
           order.items.forEach((item) => { replyMsg += `  ${item.name} x${item.qty}\n`; });
@@ -1044,7 +1107,7 @@ export async function flowOrder(db, userId, parsed, replyToken, state, { reply }
         await reply(replyToken, replyMsg.trim());
       }
     } else if (parsed.type === 'BOSS_QUERY') {
-      const results = await queryAllOrdersByDate(db, parsed.date);
+      const results = await queryAllOrdersByDate(db, parsed.date, worldId);
       if (results.length === 0) {
         await reply(replyToken, `📋 查無訂單\n日期: ${parsed.date}`);
       } else {
@@ -1068,28 +1131,23 @@ function analyzeInputError(text) {
 
   const first = lines[0];
   
-  // 檢查是否為訂單格式（第一行是分店名稱）
+  // 檢查是否為下訂單格式（每行「品項名稱 數量」，無分店）
   if (first !== '修改' && first !== '改' && first !== '查詢' && first !== '老闆查詢' && first !== '老闆查') {
-    // 可能是下訂單格式
     if (lines.length === 1) {
-      return {
-        type: 'ORDER_MISSING_ITEMS',
-        message: '❌ 下訂單格式錯誤\n\n您只輸入了分店名稱，缺少品項資訊\n\n📋 正確格式：\n分店名稱\n品項名稱 數量\n品項名稱 數量\n\n💡 範例：\n台北店\n大杯紙杯 100\n小杯紙杯 50'
-      };
-    }
-    
-    // 檢查品項格式
-    const itemErrors = [];
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i];
-      // 檢查是否為日期/時間格式（最後一行可能是日期）
-      if (i === lines.length - 1 && /^(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}:\d{2})$/.test(line)) {
-        continue;
+      const m = first.match(/^(.+?)\s+(\d+)$/);
+      if (!m) {
+        return {
+          type: 'ORDER_MISSING_ITEMS',
+          message: '❌ 下訂單格式錯誤\n\n請輸入「品項名稱 數量」，每行一筆。\n\n📋 正確格式：\n品項名稱 數量\n品項名稱 數量\n\n💡 範例：\n珍珠奶茶 5\n紅茶 3'
+        };
       }
-      
+    }
+    const itemErrors = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (i === lines.length - 1 && /^(\d{4}[-/]\d{1,2}[-/]\d{1,2})(?:\s|$)/.test(line)) continue;
       const itemMatch = line.match(/^(.+?)\s+(\d+)$/);
       if (!itemMatch) {
-        // 檢查是否有數字但格式不對
         if (/\d/.test(line)) {
           itemErrors.push({ line: i + 1, text: line, reason: '數量格式錯誤（數量必須是正整數，且與品項名稱用空格分隔）' });
         } else {
@@ -1097,21 +1155,16 @@ function analyzeInputError(text) {
         }
       } else {
         const qty = Number(itemMatch[2]);
-        if (qty <= 0) {
-          itemErrors.push({ line: i + 1, text: line, reason: '數量必須大於 0' });
-        } else if (qty > 999999) {
-          itemErrors.push({ line: i + 1, text: line, reason: '數量超過上限（最多 999999）' });
-        } else if (!Number.isInteger(qty)) {
-          itemErrors.push({ line: i + 1, text: line, reason: '數量必須是整數' });
-        }
+        if (qty <= 0) itemErrors.push({ line: i + 1, text: line, reason: '數量必須大於 0' });
+        else if (qty > 999999) itemErrors.push({ line: i + 1, text: line, reason: '數量超過上限（最多 999999）' });
+        else if (!Number.isInteger(qty)) itemErrors.push({ line: i + 1, text: line, reason: '數量必須是整數' });
       }
     }
-    
     if (itemErrors.length > 0) {
       const errorDetails = itemErrors.map(e => `第 ${e.line} 行「${e.text}」：${e.reason}`).join('\n');
       return {
         type: 'ORDER_ITEM_ERROR',
-        message: `❌ 下訂單格式錯誤\n\n${errorDetails}\n\n📋 正確格式：\n分店名稱\n品項名稱 數量\n品項名稱 數量\n\n💡 範例：\n台北店\n大杯紙杯 100\n小杯紙杯 50\n\n⚠️ 注意：\n• 品項名稱和數量之間必須用空格分隔\n• 數量必須是 1-999999 之間的正整數`
+        message: `❌ 下訂單格式錯誤\n\n${errorDetails}\n\n📋 正確格式：\n品項名稱 數量\n品項名稱 數量\n\n💡 範例：\n珍珠奶茶 5\n紅茶 3\n\n⚠️ 注意：\n• 品項名稱和數量之間用空格分隔\n• 數量為 1-999999 正整數`
       };
     }
   }
@@ -1153,18 +1206,11 @@ function analyzeInputError(text) {
     }
   }
   
-  // 檢查是否為查詢格式
   if (first === '查詢') {
     if (lines.length < 2) {
       return {
         type: 'QUERY_MISSING_DATE',
-        message: '❌ 查詢格式錯誤\n\n缺少日期\n\n📋 正確格式：\n查詢\n今天（或 2024-01-15）\n分店名稱\n\n💡 範例：\n查詢\n今天\n台北店\n查詢\n2024-01-15\n台北店'
-      };
-    }
-    if (lines.length < 3) {
-      return {
-        type: 'QUERY_MISSING_BRANCH',
-        message: '❌ 查詢格式錯誤\n\n缺少分店名稱\n\n📋 正確格式：\n查詢\n今天（或 2024-01-15）\n分店名稱\n\n💡 範例：\n查詢\n今天\n台北店\n查詢\n2024-01-15\n台北店'
+        message: '❌ 查詢格式錯誤\n\n缺少日期\n\n📋 正確格式：\n查詢\n今天（或 2024-01-15）\n\n💡 範例：\n查詢\n今天\n查詢\n2024-01-15'
       };
     }
   }
@@ -1216,7 +1262,7 @@ export async function flowViewAllWorlds(db, userId, replyToken, state, { reply }
     msg += '💡 提示：\n';
     msg += '• 輸入「切換世界」可切換到其他店家\n';
     msg += '• 輸入「當前店家」查看目前使用的店家\n';
-    msg += '• 輸入「退出世界」可離開店家';
+    msg += '• 輸入「刪除世界」或「退出世界」可刪除/離開店家';
     
     await reply(replyToken, msg);
   } catch (err) {
@@ -1350,6 +1396,7 @@ export async function flowSwitchWorld(db, userId, worldCmd, replyToken, state, {
     }
     
     await setCurrentWorld(db, userId, world.id);
+    console.log(`✅ LINE 已切換世界 userId=${userId} currentWorldId=${world.id} (${world.name || world.id})`);
     const worldName = world.name || `世界 #${formatWorldId(world.id)}`;
     const worldCode = world.worldCode ? ` (代碼: ${world.worldCode})` : '';
     const statusText = world.status === 'active' ? '✅ 已切換' : '⚠️ 已切換（此世界尚未完成設定）';
@@ -1373,7 +1420,7 @@ export async function flowSwitchWorld(db, userId, worldCmd, replyToken, state, {
 }
 
 /**
- * 退出世界提示
+ * 刪除/退出世界提示（老闆=刪除世界需二次確認，消費者=退出世界）
  */
 export async function flowLeaveWorldPrompt(db, userId, replyToken, state, { reply }) {
   try {
@@ -1382,97 +1429,136 @@ export async function flowLeaveWorldPrompt(db, userId, replyToken, state, { repl
       await reply(replyToken, '❌ 您尚未加入任何世界');
       return;
     }
-    
-    let msg = '🚪 退出世界\n\n';
-    msg += '請輸入要退出的世界 ID 或代碼：\n\n';
-    
+    const isOwner = state.isOwner;
+    let msg = isOwner ? '🗑️ 刪除世界\n\n' : '🚪 退出世界\n\n';
+    if (isOwner) {
+      msg += '您是此世界的擁有者（老闆）。刪除後該世界所有內容（訂單、菜單、成員等）將永久刪除，無法復原。\n\n';
+      msg += '請輸入要刪除的世界 ID 或代碼：\n\n';
+    } else {
+      msg += '請輸入要退出的世界 ID 或代碼：\n\n';
+    }
     for (let i = 0; i < worlds.length; i++) {
       const w = worlds[i];
       const worldName = w.name || `世界 #${formatWorldId(w.worldId)}`;
       const worldCode = w.worldCode ? ` (${w.worldCode})` : '';
-      const roleText = w.role === 'owner' ? ' [擁有者]' : '';
-      
+      const roleText = w.role === 'owner' ? ' [擁有者/老闆]' : '';
       msg += `   ${i + 1}. ${worldName}${worldCode}${roleText}\n`;
     }
-    
-    msg += '\n⚠️ 注意：\n';
-    msg += '• 退出後將無法再使用該世界的訂單功能\n';
-    msg += '• 擁有者退出世界後，世界將保留（但您將失去擁有者權限）\n';
-    msg += '• 如果這是您唯一的世界，退出後需要重新加入或建立世界\n\n';
-    msg += '💡 輸入方式：\n';
+    msg += '\n💡 輸入方式：\n';
     msg += '• 世界 ID：例如 1 或 #000001\n';
     msg += '• 世界代碼：例如 ABC12345\n';
-    msg += '• 或直接輸入「退出世界 [ID/代碼]」';
-    
+    if (isOwner) {
+      msg += '• 輸入後會再請您「確認刪除世界」一次\n';
+      msg += '• 或直接輸入「確認刪除世界 [ID/代碼]」執行刪除';
+    } else {
+      msg += '• 或直接輸入「退出世界 [ID/代碼]」';
+    }
     await reply(replyToken, msg);
   } catch (err) {
-    console.error('❌ 退出世界提示失敗:', err);
+    console.error('❌ 刪除/退出世界提示失敗:', err);
     await reply(replyToken, '❌ 查詢世界列表時發生錯誤，請稍後再試');
   }
 }
 
 /**
- * 退出世界
+ * 刪除/退出世界：老闆選世界時只顯示二次確認提示；消費者直接退出
  */
 export async function flowLeaveWorld(db, userId, worldCmd, replyToken, state, { reply }) {
   try {
     let world = null;
-    
     if (worldCmd.worldId) {
       world = await getWorldById(db, worldCmd.worldId);
     } else if (worldCmd.worldCode) {
       world = await getWorldByCode(db, worldCmd.worldCode);
     }
-    
     if (!world) {
-      await reply(replyToken, '❌ 找不到這個世界\n\n請確認世界 ID 或代碼是否正確\n\n輸入「退出世界」查看可用世界列表');
+      await reply(replyToken, '❌ 找不到這個世界\n\n請確認世界 ID 或代碼是否正確\n\n輸入「刪除世界」或「退出世界」查看列表');
       return;
     }
-    
     const bindings = await getBindings(db, userId);
     const binding = bindings.find((b) => b.worldId === world.id);
     if (!binding) {
       await reply(replyToken, '❌ 您尚未加入此世界');
       return;
     }
-    
+    const worldName = world.name || `世界 #${formatWorldId(world.id)}`;
+    const worldCodeStr = world.worldCode ? ` 或 ${world.worldCode}` : '';
+    // 老闆：不直接刪除，要求輸入「確認刪除世界 [ID/代碼]」
+    if (binding.role === 'owner') {
+      const msg =
+        `⚠️ 刪除後該世界所有內容將永久刪除，無法復原。\n\n` +
+        `包含：訂單、訂單歷史、菜單、成員、設定等。\n\n` +
+        `若確定要刪除「${worldName}」，請輸入：\n` +
+        `確認刪除世界 ${world.id}${worldCodeStr ? `\n或\n確認刪除世界 ${world.worldCode}` : ''}`;
+      await reply(replyToken, msg);
+      return;
+    }
+    // 消費者：直接解除綁定
     const currentWorldId = await getCurrentWorld(db, userId);
     const isCurrent = currentWorldId === world.id;
-    
-    // 解除綁定
     await unbindUserFromWorld(db, userId, world.id);
-    
-    // 如果退出的是當前世界，清除當前世界設定
     if (isCurrent) {
       db.run('DELETE FROM user_current_world WHERE userId = ?', [userId], (err) => {
         if (err) console.error('❌ 清除當前世界失敗:', err);
       });
     }
-    
-    const worldName = world.name || `世界 #${formatWorldId(world.id)}`;
     const remainingWorlds = bindings.filter((b) => b.worldId !== world.id);
-    
     let msg = `✅ 已退出「${worldName}」\n\n`;
-    
     if (remainingWorlds.length === 0) {
-      msg += '您現在沒有任何世界了\n\n';
-      msg += '請選擇：\n';
-      msg += '1️⃣ 加入既有世界\n';
-      msg += '2️⃣ 建立新世界';
+      msg += '您現在沒有任何世界了\n\n請選擇：\n1️⃣ 加入既有世界\n2️⃣ 建立新世界';
     } else {
       msg += `您還有 ${remainingWorlds.length} 個世界\n\n`;
-      if (isCurrent) {
-        msg += '⚠️ 已清除當前世界設定\n';
-        msg += '請使用「切換世界」選擇要使用的世界';
-      } else {
-        msg += '輸入「我的店家」查看剩餘的世界';
-      }
+      if (isCurrent) msg += '⚠️ 已清除當前世界設定，請使用「切換世界」選擇要使用的世界';
+      else msg += '輸入「我的店家」查看剩餘的世界';
     }
-    
     await reply(replyToken, msg);
   } catch (err) {
     console.error('❌ 退出世界失敗:', err);
     await reply(replyToken, '❌ 退出世界時發生錯誤，請稍後再試');
+  }
+}
+
+/**
+ * 老闆確認刪除世界（已輸入「確認刪除世界 [ID/代碼]」）
+ */
+export async function flowConfirmDeleteWorld(db, userId, worldCmd, replyToken, state, { reply }) {
+  try {
+    let world = null;
+    if (worldCmd.worldId) {
+      world = await getWorldById(db, worldCmd.worldId);
+    } else if (worldCmd.worldCode) {
+      world = await getWorldByCode(db, worldCmd.worldCode);
+    }
+    if (!world) {
+      await reply(replyToken, '❌ 找不到這個世界\n\n請確認世界 ID 或代碼是否正確');
+      return;
+    }
+    const bindings = await getBindings(db, userId);
+    const binding = bindings.find((b) => b.worldId === world.id);
+    if (!binding || binding.role !== 'owner') {
+      await reply(replyToken, '❌ 僅世界擁有者（老闆）可以刪除世界');
+      return;
+    }
+    const currentWorldId = await getCurrentWorld(db, userId);
+    const worldName = world.name || `世界 #${formatWorldId(world.id)}`;
+    await deleteWorldPermanently(db, world.id);
+    if (currentWorldId === world.id) {
+      db.run('DELETE FROM user_current_world WHERE userId = ?', [userId], (err) => {
+        if (err) console.error('❌ 清除當前世界失敗:', err);
+      });
+    }
+    console.log(`✅ LINE 已刪除世界 userId=${userId} worldId=${world.id} (${worldName})`);
+    const remaining = await getBindings(db, userId);
+    let msg = `✅ 已刪除世界「${worldName}」，該世界所有內容已永久移除。\n\n`;
+    if (remaining.length === 0) {
+      msg += '您現在沒有任何世界了\n\n請選擇：\n1️⃣ 加入既有世界\n2️⃣ 建立新世界';
+    } else {
+      msg += `您還有 ${remaining.length} 個世界。輸入「我的店家」查看。`;
+    }
+    await reply(replyToken, msg);
+  } catch (err) {
+    console.error('❌ 刪除世界失敗:', err);
+    await reply(replyToken, '❌ 刪除世界時發生錯誤，請稍後再試');
   }
 }
 
@@ -1481,13 +1567,13 @@ function getFallbackStage(state) {
   if (!state.isWorldActive) {
     const note = '此世界尚未完成設定\n・員工請等待老闆完成設定\n・老闆可繼續進行設定';
     const customSuffix = state.isOwner
-      ? `格式範例：\n廠商A\n  分店A\n    大杯紙杯 10\n    小杯紙杯 10\n  分店B\n    大杯紙杯 10\n    小杯紙杯 10\n\n輸入「重來」放棄建立並重新選擇`
+      ? `格式範例：\n廠商A\n  品項1 10\n  品項2 10\n\n輸入「重來」放棄建立並重新選擇`
       : '輸入「重來」可重新選擇世界';
     return { name: '世界設定中', note, customSuffix };
   }
   return {
     name: '訂單／查詢／修改',
-    example: '分店→換行→品項 數量｜查詢 日期 分店｜修改 品項 ±1｜老闆查詢 日期｜幫助｜清理（僅老闆）',
+    example: '品項 數量（每行一筆）｜查詢 日期｜修改 品項 ±1｜老闆查詢 日期｜幫助｜清理（僅老闆）',
   };
 }
 

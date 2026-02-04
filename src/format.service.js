@@ -136,11 +136,11 @@ export function formatOrdersByDisplayFormat(orders, displayFormat, getVendorByIt
       for (const itemName of items) {
         const rec = vendorMap[vendor][branch][itemName];
         const names = Object.keys(rec.byUser || {}).filter(Boolean).sort();
-        
+        const branchDisplay = branch === '' ? '—' : branch;
         // 替換模板變數
         let line = displayFormat.template
           .replace(/\{vendor\}/g, vendor)
-          .replace(/\{branch\}/g, branch)
+          .replace(/\{branch\}/g, branchDisplay)
           .replace(/\{item\}/g, itemName)
           .replace(/\{qty\}/g, rec.total);
         
@@ -189,7 +189,7 @@ export function formatOrdersByVendorDefault(orders, getVendorByItem) {
     output += `${vendor}\n`;
     const branches = Object.keys(vendorMap[vendor]).sort();
     for (const branch of branches) {
-      output += ` ${branch}\n`;
+      if (branch !== '') output += ` ${branch}\n`;
       const items = Object.keys(vendorMap[vendor][branch]).sort();
       for (const itemName of items) {
         const rec = vendorMap[vendor][branch][itemName];
