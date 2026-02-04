@@ -2437,28 +2437,44 @@ app.get('/api/orders/my', async (req, res) => {
 
 /**
  * 查看菜單
- * GET /api/menu?userId=xxx
+ * GET /api/menu?userId=xxx&worldId=yyy（worldId 可選；有傳則回傳該世界菜單，避免依賴 current 時序）
  */
 app.get('/api/menu', async (req, res) => {
   try {
-    const { userId } = req.query;
-    
+    const { userId, worldId: queryWorldId } = req.query;
+
     if (!userId) {
       return res.status(400).json({ error: '缺少必要參數：userId' });
     }
-    
-    // 以「當前世界」為主，而不是任一 active 世界
-    const current = await getAndValidateCurrentWorld(db, userId);
-    if (!current) {
-      const bindings = await getBindings(db, userId);
-      const msg = bindings.length === 0
-        ? '您尚未加入任何世界'
-        : '此世界尚未完成設定\n・員工請等待老闆完成設定\n・老闆可繼續進行設定';
-      return res.status(403).json({ error: msg });
+
+    const bindings = await getBindings(db, userId);
+    if (bindings.length === 0) {
+      return res.status(403).json({ error: '您尚未加入任何世界' });
     }
-    
-    const world = await getWorldById(db, current.worldId);
-    const vendorMap = await getVendorMap(db, current.worldId);
+
+    let worldIdToUse = null;
+    if (queryWorldId != null && queryWorldId !== '') {
+      const requestedId = parseInt(queryWorldId, 10);
+      if (!isNaN(requestedId) && bindings.some((b) => b.worldId === requestedId)) {
+        const binding = bindings.find((b) => b.worldId === requestedId);
+        if (binding && binding.status === 'active') {
+          worldIdToUse = requestedId;
+        }
+      }
+      if (worldIdToUse == null) {
+        return res.status(403).json({ error: '無權限查看該世界或世界尚未啟用' });
+      }
+    } else {
+      const current = await getAndValidateCurrentWorld(db, userId);
+      if (!current) {
+        const msg = '此世界尚未完成設定\n・員工請等待老闆完成設定\n・老闆可繼續進行設定';
+        return res.status(403).json({ error: msg });
+      }
+      worldIdToUse = current.worldId;
+    }
+
+    const world = await getWorldById(db, worldIdToUse);
+    const vendorMap = await getVendorMap(db, worldIdToUse);
     
     let itemAttributeOptions = {};
     if (world.itemAttributeOptions) {
@@ -2502,7 +2518,7 @@ app.get('/api/menu', async (req, res) => {
     const itemImages = await new Promise((resolve, reject) => {
       db.all(
         'SELECT vendor, itemName, imageUrl FROM menu_item_images WHERE worldId = ?',
-        [current.worldId],
+        [worldIdToUse],
         (err, rows) => {
           if (err) reject(err);
           else {
