@@ -1838,7 +1838,7 @@ app.get('/api/orders/received', async (req, res) => {
       const branch = (orderItems && orderItems.length > 0) ? orderItems[0].branch : newData.branch;
       const world = orderWorldId ? await getWorldById(db, orderWorldId) : null;
       const worldName = world ? (world.name || `世界 #${String(world.id).padStart(6, '0')}`) : null;
-      
+      const cancelled = !(orderItems && orderItems.length > 0);
       results.push({
         orderId: row.order_id,
         branch,
@@ -1847,10 +1847,11 @@ app.get('/api/orders/received', async (req, res) => {
         user: row.user,
         userId: row.userId,
         worldName,
-        worldCode: world?.worldCode || null
+        worldCode: world?.worldCode || null,
+        cancelled
       });
     }
-    
+
     const sorted = results.sort((a, b) => {
       const ua = (a.user || '').localeCompare ? (a.user || '') : String(a.user || '');
       const ub = (b.user || '').localeCompare ? (b.user || '') : String(b.user || '');
@@ -2223,7 +2224,7 @@ app.get('/api/orders/received/preview', async (req, res) => {
         ? orderItems.map(oi => ({ name: oi.item, item: oi.item, qty: oi.qty }))
         : newData.items;
       const branchVal = (orderItems && orderItems.length > 0) ? orderItems[0].branch : newData.branch;
-      
+      const cancelled = !(orderItems && orderItems.length > 0);
       for (const item of displayItems) {
         const itemName = item.name || item.item || '';
         const vendor = (vendorMap && itemName) ? (resolveVendorForItemName(itemName, vendorMap) || getVendorByItem(itemName) || '') : '';
@@ -2238,7 +2239,8 @@ app.get('/api/orders/received/preview', async (req, res) => {
           userId: row.userId || '',
           createdAt: row.created_at,
           worldName,
-          worldCode
+          worldCode,
+          cancelled
         });
       }
     }
@@ -2409,6 +2411,7 @@ app.get('/api/orders/my', async (req, res) => {
         ? orderItems.map(oi => ({ name: oi.item, item: oi.item, qty: oi.qty }))
         : newData.items;
       
+      const cancelled = !(orderItems && orderItems.length > 0);
       results.push({
         orderId: row.order_id,
         branch: (orderItems && orderItems.length > 0) ? orderItems[0].branch : (newData.branch || '多分店'),
@@ -2417,10 +2420,11 @@ app.get('/api/orders/my', async (req, res) => {
         user: row.user, // 保留顯示名稱，用於顯示「誰點的」
         worldId: orderWorldId,
         worldName: worldName,
-        worldCode: worldCode
+        worldCode: worldCode,
+        cancelled
       });
     }
-    
+
     console.log(`📊 最終結果: ${results.length} 筆訂單`);
     
     res.json({
